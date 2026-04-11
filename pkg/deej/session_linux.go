@@ -3,6 +3,8 @@ package deej
 import (
 	"errors"
 	"fmt"
+	"os/exec"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -221,4 +223,60 @@ func parseChannelVolumes(volumes []uint32) float32 {
 	}
 
 	return float32(level) / float32(len(volumes)) / float32(maxVolume)
+}
+
+// pipewireSession controls the volume of a native PipeWire audio stream
+// via wpctl, for apps that bypass PulseAudio entirely (e.g. newer Spotify).
+type pipewireSession struct {
+	baseSession
+	nodeID uint32
+}
+
+func newPipewireSession(logger *zap.SugaredLogger, nodeID uint32, processName string) *pipewireSession {
+	s := &pipewireSession{
+		nodeID: nodeID,
+	}
+
+	s.name = processName
+	s.humanReadableDesc = processName
+	s.logger = logger.Named(fmt.Sprintf("pipewire.%s", strings.ToLower(processName)))
+	s.logger.Debugw(sessionCreationLogMessage, "session", s)
+
+	return s
+}
+
+func (s *pipewireSession) GetVolume() float32 {
+	out, err := exec.Command("wpctl", "get-volume", fmt.Sprintf("%d", s.nodeID)).Output()
+	if err != nil {
+		s.logger.Warnw("Failed to get PipeWire session volume", "error", err)
+		return 0
+	}
+
+	// wpctl outputs e.g. "Volume: 0.5000\n"
+	var vol float32
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "Volume: %f", &vol); err != nil {
+		s.logger.Warnw("Failed to parse wpctl volume output", "output", string(out), "error", err)
+		return 0
+	}
+
+	return vol
+}
+
+func (s *pipewireSession) SetVolume(v float32) error {
+	s.logger.Debugw("Adjusting PipeWire session volume", "to", fmt.Sprintf("%.2f", v))
+
+	if err := exec.Command("wpctl", "set-volume", fmt.Sprintf("%d", s.nodeID), fmt.Sprintf("%.4f", v)).Run(); err != nil {
+		s.logger.Warnw("Failed to set PipeWire session volume", "error", err, "volume", v)
+		return fmt.Errorf("set pipewire volume: %w", err)
+	}
+
+	return nil
+}
+
+func (s *pipewireSession) Release() {
+	s.logger.Debug("Releasing PipeWire audio session")
+}
+
+func (s *pipewireSession) String() string {
+	return fmt.Sprintf(sessionStringFormat, s.humanReadableDesc, s.GetVolume())
 }

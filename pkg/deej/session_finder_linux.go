@@ -1,12 +1,24 @@
 package deej
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os/exec"
+	"strings"
 
 	"github.com/jfreymuth/pulse/proto"
 	"go.uber.org/zap"
 )
+
+// pwDumpNode is used to parse relevant fields from pw-dump JSON output
+type pwDumpNode struct {
+	ID   uint32 `json:"id"`
+	Type string `json:"type"`
+	Info struct {
+		Props map[string]interface{} `json:"props"`
+	} `json:"info"`
+}
 
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
@@ -71,7 +83,91 @@ func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 		return nil, fmt.Errorf("enumerate audio sessions: %w", err)
 	}
 
+	// build a set of process names already found via PulseAudio to avoid duplicates
+	existingNames := make(map[string]bool)
+	for _, s := range sessions {
+		existingNames[s.Key()] = true
+	}
+
+	// enumerate native PipeWire sessions (apps that bypass PulseAudio entirely)
+	if err := sf.enumeratePipeWireSessions(&sessions, existingNames); err != nil {
+		sf.logger.Warnw("Failed to enumerate PipeWire sessions (non-fatal)", "error", err)
+	}
+
 	return sessions, nil
+}
+
+func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existingNames map[string]bool) error {
+	out, err := exec.Command("pw-dump").Output()
+	if err != nil {
+		return fmt.Errorf("run pw-dump: %w", err)
+	}
+
+	var nodes []pwDumpNode
+	if err := json.Unmarshal(out, &nodes); err != nil {
+		return fmt.Errorf("parse pw-dump output: %w", err)
+	}
+
+	// pass 1: build a clientID → process name map from PipeWire Client objects.
+	// the app name lives on the Client, not on the stream Node itself.
+	clientNames := make(map[uint32]string)
+	for _, node := range nodes {
+		if node.Type != "PipeWire:Interface:Client" {
+			continue
+		}
+		props := node.Info.Props
+		var name string
+		if binary, ok := props["application.process.binary"].(string); ok && binary != "" {
+			name = binary
+		} else if appName, ok := props["application.name"].(string); ok && appName != "" {
+			name = appName
+		}
+		if name != "" {
+			clientNames[node.ID] = name
+		}
+	}
+
+	// pass 2: find audio output stream Nodes and resolve their name via client.id.
+	// only stream Nodes (not Clients) support wpctl volume control.
+	for _, node := range nodes {
+		if node.Type != "PipeWire:Interface:Node" {
+			continue
+		}
+
+		props := node.Info.Props
+
+		mclass, _ := props["media.class"].(string)
+		if mclass != "Stream/Output/Audio" {
+			continue
+		}
+
+		// link the stream node back to its owning client to get the app name
+		clientIDFloat, ok := props["client.id"].(float64)
+		if !ok {
+			continue
+		}
+		clientID := uint32(clientIDFloat)
+
+		name, ok := clientNames[clientID]
+		if !ok {
+			continue
+		}
+
+		nameLower := strings.ToLower(name)
+
+		// skip anything already handled by PulseAudio (or a previous PW iteration)
+		if existingNames[nameLower] {
+			continue
+		}
+
+		sf.logger.Debugw("Found PipeWire-native audio session", "name", name, "nodeID", node.ID)
+
+		newSession := newPipewireSession(sf.sessionLogger, node.ID, name)
+		*sessions = append(*sessions, newSession)
+		existingNames[nameLower] = true
+	}
+
+	return nil
 }
 
 func (sf *paSessionFinder) Release() error {
