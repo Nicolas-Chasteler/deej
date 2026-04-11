@@ -20,12 +20,22 @@ type pwDumpNode struct {
 	} `json:"info"`
 }
 
+// PulseAudio subscription event bit masks
+const (
+	paEventFacilityMask  = 0x000F
+	paEventFacilitySinkInput = 0x0002
+	paEventTypeMask      = 0x0030
+	paEventTypeNew       = 0x0000
+	paSubscriptionMaskSinkInput = 0x0004
+)
+
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
 	sessionLogger *zap.SugaredLogger
 
-	client *proto.Client
-	conn   net.Conn
+	client       *proto.Client
+	conn         net.Conn
+	newSessionCh chan struct{}
 }
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
@@ -51,6 +61,29 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		sessionLogger: logger.Named("sessions"),
 		client:        client,
 		conn:          conn,
+		newSessionCh:  make(chan struct{}, 1),
+	}
+
+	// subscribe to sink input events so we're notified the moment a new audio
+	// stream opens, rather than waiting for the next polling cycle
+	client.Callback = func(msg interface{}) {
+		event, ok := msg.(*proto.SubscribeEvent)
+		if !ok {
+			return
+		}
+		facility := event.Event & paEventFacilityMask
+		eventType := event.Event & paEventTypeMask
+		if facility == paEventFacilitySinkInput && eventType == paEventTypeNew {
+			// non-blocking send: if a signal is already queued, no need to queue another
+			select {
+			case sf.newSessionCh <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	if err := client.Request(&proto.Subscribe{Mask: paSubscriptionMaskSinkInput}, nil); err != nil {
+		sf.logger.Warnw("Failed to subscribe to PulseAudio events (non-fatal)", "error", err)
 	}
 
 	sf.logger.Debug("Created PA session finder instance")
@@ -168,6 +201,10 @@ func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existi
 	}
 
 	return nil
+}
+
+func (sf *paSessionFinder) NewSessionChannel() <-chan struct{} {
+	return sf.newSessionCh
 }
 
 func (sf *paSessionFinder) Release() error {

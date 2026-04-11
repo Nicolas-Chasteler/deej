@@ -81,8 +81,20 @@ func (m *sessionMap) initialize() error {
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
+	m.setupOnNewSession()
 
 	return nil
+}
+
+func (m *sessionMap) setupOnNewSession() {
+	newSessionCh := m.sessionFinder.NewSessionChannel()
+
+	go func() {
+		for range newSessionCh {
+			m.logger.Debug("New audio session detected, refreshing immediately")
+			m.refreshSessions(true)
+		}
+	}()
 }
 
 func (m *sessionMap) release() error {

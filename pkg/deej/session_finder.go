@@ -4,5 +4,9 @@ package deej
 type SessionFinder interface {
 	GetAllSessions() ([]Session, error)
 
+	// NewSessionChannel returns a channel that receives a signal whenever a new
+	// audio session is detected. Callers should refresh sessions on each signal.
+	NewSessionChannel() <-chan struct{}
+
 	Release() error
 }
