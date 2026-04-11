@@ -271,7 +271,6 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		return
 	}
 
-	targetFound := false
 	adjustmentFailed := false
 
 	// for each possible target for this slider...
@@ -292,8 +291,6 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 				continue
 			}
 
-			targetFound = true
-
 			// iterate all matching sessions and adjust the volume of each one
 			for _, session := range sessions {
 				if session.GetVolume() != event.PercentValue {
@@ -306,17 +303,17 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		}
 	}
 
-	// if we still haven't found a target or the volume adjustment failed, maybe look for the target again.
-	// processes could've opened since the last time this slider moved.
-	// if they haven't, the cooldown will take care to not spam it up
-	if !targetFound {
-		m.refreshSessions(false)
-	} else if adjustmentFailed {
-
-		// performance: the reason that forcing a refresh here is okay is that we'll only get here
-		// when a session's SetVolume call errored, such as in the case of a stale master session
-		// (or another, more catastrophic failure happens)
+	// always attempt a session refresh after processing so that new audio streams
+	// for already-mapped processes (e.g. a new browser tab) are discovered and
+	// immediately receive the correct volume. the cooldown (minTimeBetweenSessionRefreshes)
+	// ensures this doesn't run more than once every 5 seconds.
+	// force a refresh on failure to clear any stale sessions.
+	if adjustmentFailed {
+		// performance: forcing is okay here because we only reach this when SetVolume
+		// errored, such as in the case of a stale master session or other failure
 		m.refreshSessions(true)
+	} else {
+		m.refreshSessions(false)
 	}
 }
 
