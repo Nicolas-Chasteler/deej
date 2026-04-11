@@ -137,6 +137,19 @@ func (sio *SerialIO) Stop() {
 	}
 }
 
+// CurrentSliderValues returns a copy of the last known slider percent values.
+// Returns nil if no values have been read yet.
+func (sio *SerialIO) CurrentSliderValues() []float32 {
+	if sio.currentSliderPercentValues == nil {
+		return nil
+	}
+	copy := make([]float32, len(sio.currentSliderPercentValues))
+	for i, v := range sio.currentSliderPercentValues {
+		copy[i] = v
+	}
+	return copy
+}
+
 // SubscribeToSliderMoveEvents returns an unbuffered channel that receives
 // a sliderMoveEvent struct every time a slider moves
 func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {

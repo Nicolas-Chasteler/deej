@@ -119,6 +119,10 @@ func (m *sessionMap) getAndAddSessions() error {
 
 	m.logger.Infow("Got all audio sessions successfully", "sessionMap", m)
 
+	// immediately push current slider positions to all sessions so newly
+	// opened streams inherit the correct volume without waiting for a slider move
+	m.applyKnownValues()
+
 	return nil
 }
 
@@ -204,6 +208,51 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 	})
 
 	return matchFound
+}
+
+// applyKnownValues pushes the current slider positions to all matching sessions.
+// This ensures newly opened audio streams immediately inherit the correct volume
+// rather than waiting for the user to move the slider.
+func (m *sessionMap) applyKnownValues() {
+	sliderValues := m.deej.serial.CurrentSliderValues()
+	if sliderValues == nil {
+		return
+	}
+
+	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		if sliderIdx >= len(sliderValues) {
+			return
+		}
+
+		value := sliderValues[sliderIdx]
+
+		// skip sliders that haven't been read yet (initialised to -1)
+		if value < 0 {
+			return
+		}
+
+		for _, target := range targets {
+			if m.targetHasSpecialTransform(target) {
+				continue
+			}
+
+			resolvedTargets := m.resolveTarget(target)
+			for _, resolvedTarget := range resolvedTargets {
+				sessions, ok := m.get(resolvedTarget)
+				if !ok {
+					continue
+				}
+
+				for _, session := range sessions {
+					if err := session.SetVolume(value); err != nil {
+						m.logger.Warnw("Failed to apply known volume to session",
+							"target", resolvedTarget,
+							"error", err)
+					}
+				}
+			}
+		}
+	})
 }
 
 func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
