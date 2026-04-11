@@ -2,10 +2,8 @@ package deej
 
 import (
 	"fmt"
-	"path/filepath"
 	"time"
 
-	"github.com/omriharel/deej/pkg/deej/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -15,23 +13,19 @@ const (
 	buildTypeDev     = "dev"
 	buildTypeRelease = "release"
 
+	// logDirectory is kept for crash logs (panic.go) and internal config path (config.go)
 	logDirectory = "logs"
-	logFilename  = "deej-latest-run.log"
 )
 
 // NewLogger provides a logger instance for the whole program
 func NewLogger(buildType string) (*zap.SugaredLogger, error) {
 	var loggerConfig zap.Config
 
-	// release: info and above, log to file only (no UI)
+	// release: info and above, log to stderr (captured by systemd/journald)
 	if buildType == buildTypeRelease {
-		if err := util.EnsureDirExists(logDirectory); err != nil {
-			return nil, fmt.Errorf("ensure log directory exists: %w", err)
-		}
-
 		loggerConfig = zap.NewProductionConfig()
 
-		loggerConfig.OutputPaths = []string{filepath.Join(logDirectory, logFilename)}
+		loggerConfig.OutputPaths = []string{"stderr"}
 		loggerConfig.Encoding = "console"
 
 		// development: debug and above, log to stderr only, colorful
