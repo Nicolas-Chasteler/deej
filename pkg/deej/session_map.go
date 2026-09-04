@@ -82,8 +82,76 @@ func (m *sessionMap) initialize() error {
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
 	m.setupOnNewSession()
+	m.setupVolumeWatchdog()
 
 	return nil
+}
+
+// setupVolumeWatchdog starts a background goroutine that periodically
+// re-asserts each slider's current value against its mapped sessions.
+// This corrects apps (e.g. Spotify, Firefox) that reset their own OS-level
+// volume and silently override the physical slider. Enabled only when
+// VolumeWatchdogInterval is non-zero in the config.
+func (m *sessionMap) setupVolumeWatchdog() {
+	interval := m.deej.config.VolumeWatchdogInterval
+	if interval <= 0 {
+		return
+	}
+
+	m.logger.Infow("Starting volume watchdog", "interval", interval)
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			m.assertSliderVolumes()
+		}
+	}()
+}
+
+// assertSliderVolumes reads the current slider positions and re-applies them
+// to any session whose reported volume has drifted, using an epsilon comparison
+// to avoid spurious writes caused by integer ↔ float rounding in the PA layer.
+func (m *sessionMap) assertSliderVolumes() {
+	const volumeEpsilon = 0.005
+
+	sliderValues := m.deej.serial.CurrentSliderValues()
+	if sliderValues == nil {
+		return
+	}
+
+	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		if sliderIdx >= len(sliderValues) {
+			return
+		}
+
+		want := sliderValues[sliderIdx]
+
+		for _, target := range targets {
+			for _, resolvedTarget := range m.resolveTarget(target) {
+				sessions, ok := m.get(resolvedTarget)
+				if !ok {
+					continue
+				}
+
+				for _, session := range sessions {
+					got := session.GetVolume()
+					if diff := got - want; diff > volumeEpsilon || diff < -volumeEpsilon {
+						m.logger.Debugw("Volume watchdog correcting drift",
+							"session", resolvedTarget,
+							"want", want,
+							"got", got)
+
+						if err := session.SetVolume(want); err != nil {
+							m.logger.Warnw("Volume watchdog failed to set volume",
+								"session", resolvedTarget, "error", err)
+						}
+					}
+				}
+			}
+		}
+	})
 }
 
 func (m *sessionMap) setupOnNewSession() {

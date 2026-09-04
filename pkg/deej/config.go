@@ -27,6 +27,13 @@ type CanonicalConfig struct {
 
 	NoiseReductionLevel string
 
+	// VolumeWatchdogInterval, when non-zero, enables a background goroutine
+	// that periodically re-asserts each slider's current value against its
+	// mapped audio sessions. Useful when apps (e.g. Spotify, Firefox) reset
+	// their own OS-level volume and override the physical slider position.
+	// Set to 0 (the default) to disable. Example values: "500ms", "1s".
+	VolumeWatchdogInterval time.Duration
+
 	logger             *zap.SugaredLogger
 	notifier           Notifier
 	stopWatcherChannel chan bool
@@ -48,11 +55,12 @@ const (
 
 	configType = "yaml"
 
-	configKeySliderMapping       = "slider_mapping"
-	configKeyInvertSliders       = "invert_sliders"
-	configKeyCOMPort             = "com_port"
-	configKeyBaudRate            = "baud_rate"
-	configKeyNoiseReductionLevel = "noise_reduction"
+	configKeySliderMapping          = "slider_mapping"
+	configKeyInvertSliders          = "invert_sliders"
+	configKeyCOMPort                = "com_port"
+	configKeyBaudRate               = "baud_rate"
+	configKeyNoiseReductionLevel    = "noise_reduction"
+	configKeyVolumeWatchdogInterval = "volume_watchdog_interval"
 
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 9600
@@ -238,6 +246,7 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	cc.VolumeWatchdogInterval = cc.userConfig.GetDuration(configKeyVolumeWatchdogInterval)
 
 	cc.logger.Debug("Populated config fields from vipers")
 
