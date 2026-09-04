@@ -32,7 +32,13 @@ type SerialIO struct {
 	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
 
-	sliderMoveConsumers []chan SliderMoveEvent
+	// currentButtonStates tracks whether each button channel is currently held
+	// down, so we can fire only on the press edge. indexed like the channels
+	// themselves; entries for slider channels are meaningless
+	currentButtonStates []bool
+
+	sliderMoveConsumers  []chan SliderMoveEvent
+	buttonPressConsumers []chan ButtonPressEvent
 }
 
 // SliderMoveEvent represents a single slider move captured by deej
@@ -40,6 +46,22 @@ type SliderMoveEvent struct {
 	SliderID     int
 	PercentValue float32
 }
+
+// ButtonPressEvent represents a single button press captured by deej
+type ButtonPressEvent struct {
+	ButtonID int
+	Command  string
+}
+
+// buttons report a raw analog value that sits at one rail or the other. we read
+// them with hysteresis so a channel resting near the middle (a floating pin, or
+// a slider someone mapped as a button by mistake) can't oscillate: it takes a
+// clear high to register a press and a clear low to release it again.
+// contact bounce is handled on the arduino side, where the timing lives
+const (
+	buttonPressedThreshold  = 700
+	buttonReleasedThreshold = 300
+)
 
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
 
@@ -49,12 +71,13 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	logger = logger.Named("serial")
 
 	sio := &SerialIO{
-		deej:                deej,
-		logger:              logger,
-		stopChannel:         make(chan bool),
-		connected:           false,
-		conn:                nil,
-		sliderMoveConsumers: []chan SliderMoveEvent{},
+		deej:                 deej,
+		logger:               logger,
+		stopChannel:          make(chan bool),
+		connected:            false,
+		conn:                 nil,
+		sliderMoveConsumers:  []chan SliderMoveEvent{},
+		buttonPressConsumers: []chan ButtonPressEvent{},
 	}
 
 	logger.Debug("Created serial i/o instance")
@@ -155,6 +178,21 @@ func (sio *SerialIO) CurrentSliderValues() []float32 {
 func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 	ch := make(chan SliderMoveEvent)
 	sio.sliderMoveConsumers = append(sio.sliderMoveConsumers, ch)
+
+	return ch
+}
+
+// SubscribeToButtonPressEvents returns a buffered channel that receives a
+// ButtonPressEvent every time a mapped button is pressed.
+//
+// Unlike the slider channels this one is buffered on purpose: its consumer
+// shells out to run a command, and a blocking send here would stall the serial
+// read loop and freeze every slider until the command returned.
+func (sio *SerialIO) SubscribeToButtonPressEvents() chan ButtonPressEvent {
+	const buttonEventBufferSize = 16
+
+	ch := make(chan ButtonPressEvent, buttonEventBufferSize)
+	sio.buttonPressConsumers = append(sio.buttonPressConsumers, ch)
 
 	return ch
 }
@@ -260,6 +298,7 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		logger.Infow("Detected sliders", "amount", numSliders)
 		sio.lastKnownNumSliders = numSliders
 		sio.currentSliderPercentValues = make([]float32, numSliders)
+		sio.currentButtonStates = make([]bool, numSliders)
 
 		// reset everything to be an impossible value to force the slider move event later
 		for idx := range sio.currentSliderPercentValues {
@@ -269,6 +308,8 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
+	pressEvents := []ButtonPressEvent{}
+
 	for sliderIdx, stringValue := range splitLine {
 
 		// convert string values to integers ("1023" -> 1023)
@@ -279,6 +320,16 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		if sliderIdx == 0 && number > 1023 {
 			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
 			return
+		}
+
+		// channels mapped as buttons never reach the volume path - they carry a
+		// pressed/released state, not a level
+		if command, isButton := sio.deej.config.ButtonMapping.get(sliderIdx); isButton {
+			if pressEvent, pressed := sio.handleButtonValue(logger, sliderIdx, number, command); pressed {
+				pressEvents = append(pressEvents, pressEvent)
+			}
+
+			continue
 		}
 
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
@@ -317,4 +368,54 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 			}
 		}
 	}
+
+	// same for button presses. these consumers are buffered, but a full buffer
+	// still can't be allowed to block the read loop - drop instead, and say so
+	for _, consumer := range sio.buttonPressConsumers {
+		for _, pressEvent := range pressEvents {
+			select {
+			case consumer <- pressEvent:
+			default:
+				logger.Warnw("Button press consumer is backed up, dropping press",
+					"button", pressEvent.ButtonID)
+			}
+		}
+	}
+}
+
+// handleButtonValue folds a raw analog reading into the button's held/released
+// state, returning a press event on the rising edge only. holding the button
+// down fires once, not once per line.
+func (sio *SerialIO) handleButtonValue(
+	logger *zap.SugaredLogger,
+	buttonIdx int,
+	rawValue int,
+	command string,
+) (ButtonPressEvent, bool) {
+
+	wasPressed := sio.currentButtonStates[buttonIdx]
+
+	// keep the slider array at a sane value for this channel, so a channel
+	// mapped as both a button and a slider can't push a negative volume
+	sio.currentSliderPercentValues[buttonIdx] = 0
+
+	switch {
+	case !wasPressed && rawValue >= buttonPressedThreshold:
+		sio.currentButtonStates[buttonIdx] = true
+
+		if sio.deej.Verbose() {
+			logger.Debugw("Button pressed", "button", buttonIdx, "command", command)
+		}
+
+		return ButtonPressEvent{ButtonID: buttonIdx, Command: command}, true
+
+	case wasPressed && rawValue <= buttonReleasedThreshold:
+		sio.currentButtonStates[buttonIdx] = false
+
+		if sio.deej.Verbose() {
+			logger.Debugw("Button released", "button", buttonIdx)
+		}
+	}
+
+	return ButtonPressEvent{}, false
 }

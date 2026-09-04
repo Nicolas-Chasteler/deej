@@ -75,6 +75,28 @@ func OpenExternal(logger *zap.SugaredLogger, cmd string, arg string) error {
 	return nil
 }
 
+// RunShellCommand runs the given command line through the platform's shell and
+// waits for it to finish, returning its combined output for logging purposes.
+//
+// Unlike OpenExternal this takes a whole command line rather than a command and
+// a single argument, because it's fed straight from the user's config - letting
+// the shell do the word splitting is the whole point.
+func RunShellCommand(commandLine string) ([]byte, error) {
+	execCommandArgs := []string{"cmd.exe", "/C", commandLine}
+	if Linux() {
+		execCommandArgs = []string{"/bin/sh", "-c", commandLine}
+	}
+
+	command := exec.Command(execCommandArgs[0], execCommandArgs[1:]...)
+
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("run shell command: %w", err)
+	}
+
+	return output, nil
+}
+
 // NormalizeScalar "trims" the given float32 to 2 points of precision (e.g. 0.15442 -> 0.15)
 // This is used both for windows core audio volume levels and for cleaning up slider level values from serial
 func NormalizeScalar(v float32) float32 {

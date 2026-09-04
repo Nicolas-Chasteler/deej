@@ -15,6 +15,14 @@ slider_mapping:
     - rocketleague.exe
   4: discord.exe
 
+# buttons share the same index space as sliders - they're just extra channels on
+# the same serial line, so a board with 5 sliders and 1 button makes the button
+# index 5. a channel listed here is treated as a button and never as a slider.
+# each button runs its command once per press, on the way down. the command runs
+# through your shell, so pipes, quotes and arguments all work as you'd expect
+# button_mapping:
+#   5: playerctl -p spotify play-pause
+
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false
 

@@ -25,6 +25,7 @@ type Deej struct {
 	config   *CanonicalConfig
 	serial   *SerialIO
 	sessions *sessionMap
+	buttons  *buttonRunner
 
 	stopChannel chan bool
 	version     string
@@ -76,6 +77,7 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 	}
 
 	d.sessions = sessions
+	d.buttons = newButtonRunner(d, logger)
 
 	logger.Debug("Created deej instance")
 
@@ -97,6 +99,9 @@ func (d *Deej) Initialize() error {
 		d.logger.Errorw("Failed to initialize session map", "error", err)
 		return fmt.Errorf("init session map: %w", err)
 	}
+
+	// start listening for button presses
+	d.buttons.initialize()
 
 	// decide whether to run with/without tray
 	if _, noTraySet := os.LookupEnv(envNoTray); noTraySet {

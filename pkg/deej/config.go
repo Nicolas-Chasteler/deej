@@ -18,6 +18,12 @@ import (
 type CanonicalConfig struct {
 	SliderMapping *sliderMap
 
+	// ButtonMapping maps channel indexes that carry a button rather than a
+	// slider to the shell command they run when pressed. Buttons share the
+	// index space with sliders - a channel is a button if, and only if, it
+	// appears here.
+	ButtonMapping *buttonMap
+
 	ConnectionInfo struct {
 		COMPort  string
 		BaudRate int
@@ -56,6 +62,7 @@ const (
 	configType = "yaml"
 
 	configKeySliderMapping          = "slider_mapping"
+	configKeyButtonMapping          = "button_mapping"
 	configKeyInvertSliders          = "invert_sliders"
 	configKeyCOMPort                = "com_port"
 	configKeyBaudRate               = "baud_rate"
@@ -153,6 +160,7 @@ func (cc *CanonicalConfig) Load() error {
 	cc.logger.Info("Loaded config successfully")
 	cc.logger.Infow("Config values",
 		"sliderMapping", cc.SliderMapping,
+		"buttonMapping", cc.ButtonMapping,
 		"connectionInfo", cc.ConnectionInfo,
 		"invertSliders", cc.InvertSliders)
 
@@ -230,6 +238,25 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
+
+	// buttons are parsed by hand rather than through viper's map helpers - see
+	// buttonMapFromConfig for why. surface anything it couldn't make sense of
+	buttonMapping, warnings := buttonMapFromConfig(cc.userConfig.Get(configKeyButtonMapping))
+	for _, warning := range warnings {
+		cc.logger.Warnw("Problem in button mapping", "problem", warning)
+	}
+
+	// a channel can be a slider or a button, not both. if it's mapped twice the
+	// button wins, since serial stops emitting move events for it - warn either
+	// way, because the slider half of that mapping will look silently broken
+	buttonMapping.iterate(func(buttonIdx int, _ string) {
+		if _, mappedAsSlider := cc.SliderMapping.get(buttonIdx); mappedAsSlider {
+			cc.logger.Warnw("Channel is mapped as both a slider and a button, treating it as a button",
+				"channel", buttonIdx)
+		}
+	})
+
+	cc.ButtonMapping = buttonMapping
 
 	// get the rest of the config fields - viper saves us a lot of effort here
 	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
