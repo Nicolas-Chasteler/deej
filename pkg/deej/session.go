@@ -19,6 +19,14 @@ type Session interface {
 	Release()
 }
 
+// staleSession is implemented by sessions that can tell when the thing they
+// point at has gone away. It's deliberately not part of Session: only the
+// PulseAudio sink-input sessions can go stale under us, and master/system/mic
+// sessions address a device that outlives any individual app.
+type staleSession interface {
+	Stale() bool
+}
+
 const (
 
 	// ideally these would share a common ground in baseSession

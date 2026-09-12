@@ -121,6 +121,13 @@ func (m *sessionMap) assertSliderVolumes() {
 		return
 	}
 
+	// Sessions die when their app closes or just stops playing, and nothing else
+	// notices promptly: a refresh otherwise waits on a slider move, and if you
+	// don't touch the box there's never one. The watchdog is the only thing
+	// touching these sessions between refreshes, so it's the right place to spot
+	// a dead one and ask for a re-acquire.
+	staleFound := false
+
 	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		if sliderIdx >= len(sliderValues) {
 			return
@@ -137,6 +144,12 @@ func (m *sessionMap) assertSliderVolumes() {
 
 				for _, session := range sessions {
 					got := session.GetVolume()
+
+					if dead, ok := session.(staleSession); ok && dead.Stale() {
+						staleFound = true
+						continue
+					}
+
 					if diff := got - want; diff > volumeEpsilon || diff < -volumeEpsilon {
 						m.logger.Debugw("Volume watchdog correcting drift",
 							"session", resolvedTarget,
@@ -152,6 +165,13 @@ func (m *sessionMap) assertSliderVolumes() {
 			}
 		}
 	})
+
+	// Not forced: with force false, refreshSessions rate-limits itself to
+	// minTimeBetweenSessionRefreshes, so a session that stays dead costs one
+	// re-acquire every few seconds rather than one per watchdog tick.
+	if staleFound {
+		m.refreshSessions(false)
+	}
 }
 
 func (m *sessionMap) setupOnNewSession() {

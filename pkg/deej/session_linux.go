@@ -25,6 +25,11 @@ type paSession struct {
 
 	sinkInputIndex    uint32
 	sinkInputChannels byte
+
+	// set once PulseAudio stops recognising our sink input index, which means
+	// the app closed or simply stopped playing. The session object is dead from
+	// that point on and only a refresh of the map can replace it.
+	stale bool
 }
 
 type masterSession struct {
@@ -102,12 +107,31 @@ func (s *paSession) GetVolume() float32 {
 	reply := proto.GetSinkInputInfoReply{}
 
 	if err := s.client.Request(&request, &reply); err != nil {
-		s.logger.Warnw("Failed to get session volume", "error", err)
+
+		// An app that closed or stopped playing takes its sink input with it,
+		// and this is the first thing to notice. That's an ordinary lifecycle
+		// event rather than a fault, so it's logged at debug - at warn, with the
+		// volume watchdog polling twice a second, one closed app buries every
+		// real message in the log.
+		s.logger.Debugw("Sink input is gone, marking session stale", "error", err)
+		s.stale = true
+
+		// Falling through here was the actual bug. parseChannelVolumes on an
+		// empty reply returns 0, so a dead session reported "volume 0", the
+		// watchdog saw that as drift against the slider and tried to correct it,
+		// forever.
+		return 0
 	}
 
-	level := parseChannelVolumes(reply.ChannelVolumes)
+	s.stale = false
 
-	return level
+	return parseChannelVolumes(reply.ChannelVolumes)
+}
+
+// Stale reports that this session's sink input no longer exists, so the session
+// map is holding something dead and should re-acquire.
+func (s *paSession) Stale() bool {
+	return s.stale
 }
 
 func (s *paSession) SetVolume(v float32) error {
