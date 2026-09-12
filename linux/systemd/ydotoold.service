@@ -1,0 +1,17 @@
+[Unit]
+# Virtual input device, so deej buttons can send keystrokes.
+#
+# Runs as the user, not as root: /dev/uinput carries a uaccess ACL granting the
+# logged-in user rw, so no group membership or system service is needed. The
+# socket path is set explicitly rather than left to the default, because that
+# default has moved between ydotool releases and deej has to find it.
+Description=ydotool daemon (virtual keyboard for deej buttons)
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,62 @@
+#!/bin/sh
+# Toggle the live microphone between the desk interface and the wireless ModMic.
+#
+# EasyEffects is the thing that actually has to move, not PipeWire's default:
+# every app records from easyeffects_source, so whichever hardware mic feeds the
+# EasyEffects input chain is the one you're heard on. There's no CLI or D-Bus
+# call to retarget it - 8.2.9 exposes presets and bypass only - and editing
+# easyeffectsrc under a running instance just gets overwritten on exit.
+#
+# The lever that does work is useDefaultInputDevice: with that on, EasyEffects
+# follows PipeWire's default source. So this sets the default to the mic we
+# want, waits for EasyEffects to pick it up, then hands the default back to
+# easyeffects_source. That second step matters - leaving the default on the raw
+# hardware means anything following the default bypasses the whole chain.
+#
+# Handing it back does not make EasyEffects retarget onto its own virtual node;
+# it holds whatever hardware device it last moved to. That was verified, not
+# assumed, and it's the reason this two-step is safe.
+
+DESK=alsa_input.usb-Burr-Brown_from_TI_USB_Audio_CODEC-00.analog-stereo-input
+WIRELESS=alsa_input.usb-Antlion_Audio_Antlion_Wireless_Microphone-00.mono-fallback
+PROCESSED=easyeffects_source
+
+notify() {
+    notify-send -a deej -t 2500 -i audio-input-microphone "Microphone" "$1"
+}
+
+# Which hardware device currently feeds the EasyEffects input chain. Read from
+# the live graph rather than from config, which lags behind the running state.
+#
+# Only indented lines count as links. The ee_sie_* filter nodes also appear as
+# top-level entries in pw-link output, so matching ee_sie_ anywhere hits one of
+# those before any device line and reports an empty result.
+current=$(pw-link -l 2>/dev/null | awk '
+    /^[^ \t]/ { dev = (/^alsa_input\./) ? $0 : ""; next }
+    dev != "" && /ee_sie_/ { print dev; exit }
+' | cut -d: -f1)
+
+case "$current" in
+    "$WIRELESS") target=$DESK  ; label="Desk interface (PCM2902)" ;;
+    *)           target=$WIRELESS ; label="Wireless (Antlion)" ;;
+esac
+
+# The Antlion is wireless: switch it off and the node disappears entirely, so a
+# blind set-default would silently leave you on a mic that isn't there.
+if ! pactl list short sources | cut -f2 | grep -qx "$target"; then
+    notify "$label is not connected - staying put"
+    exit 1
+fi
+
+pactl set-default-source "$target" || exit 1
+
+# EasyEffects needs a moment to notice the default moved and rebuild the chain.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    if pw-link -l 2>/dev/null | grep -A2 "^$target" | grep -q ee_sie_; then
+        break
+    fi
+done
+
+pactl set-default-source "$PROCESSED"
+notify "$label"

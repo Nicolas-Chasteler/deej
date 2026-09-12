@@ -1,0 +1,69 @@
+# process names are case-insensitive
+# you can use 'master' to indicate the master channel, or a list of process names to create a group
+# you can use 'mic' to control your mic input level (uses the default recording device)
+# you can use 'deej.unmapped' to control all apps that aren't bound to any slider (this ignores master, system, mic and device-targeting sessions) (experimental)
+# windows only - you can use 'deej.current' to control the currently active app (whether full-screen or not) (experimental)
+# windows only - you can use a device's full name, i.e. "Speakers (Realtek High Definition Audio)", to bind it. this works for both output and input devices
+# windows only - you can use 'system' to control the "system sounds" volume
+# important: slider indexes start at 0, regardless of which analog pins you're using!
+slider_mapping:
+  0: master
+  1:
+    - firefox
+    - jellyfinmediaplayer
+  2: spotify
+  3: discord
+  4: deej.unmapped
+
+# buttons share the same index space as sliders - they're just extra channels on
+# the same serial line, so with 5 sliders the first button is index 5. a channel
+# listed here is treated as a button and never as a slider. each button runs its
+# command once per press, on the way down. the command runs through your shell,
+# so pipes, quotes and arguments all work as you'd expect.
+#
+# Laid out as two pairs: the back two are the microphone, the front two are
+# media. Four unrelated functions would need memorising; two pairs don't.
+#
+# Channels run back-to-front - 8 is the switch nearest the back wall, 5 the one
+# nearest you - so these are listed in physical order rather than numeric order,
+# to read the way the box actually is.
+#
+# Only the Discord one is a keystroke, because Discord exposes mute no other
+# way. Everything else calls a real interface, which means it doesn't need a key
+# bound anywhere and doesn't care which window has focus. Prefer that whenever
+# the target offers it.
+#
+# On the keystroke: F16 because this keyboard stops at F15, so nothing else can
+# ever send it and no app already has it bound. The numbers are Linux keycodes
+# from input-event-codes.h - F16 is 186 - with :1 for down and :0 for up.
+#
+# ydotool, not wtype or xdotool: this is a KDE Wayland session, KWin doesn't
+# advertise zwp_virtual_keyboard_manager_v1 (so wtype can't work) and xdotool
+# can't reach native Wayland windows. ydotool injects through /dev/uinput, below
+# the compositor, so the event is indistinguishable from the real keyboard -
+# which is what lets Discord pick it up globally.
+button_mapping:
+  8: ydotool key 186:1 186:0                   # back  - F16 -> discord mic mute
+  7: /home/beqren/.local/bin/deej-mic-toggle   #       - swap desk mic <-> wireless
+  # Spotify first, then anything else. Bare playerctl follows whichever player
+  # was last active, which sounds smarter and isn't: with a YouTube tab open,
+  # these buttons silently start controlling Firefox instead. The comma list is
+  # a priority order and %any is the fallback, so Spotify wins whenever it's
+  # running and a browser tab still works when it isn't.
+  6: playerctl -p spotify,%any next            #       - next track
+  5: playerctl -p spotify,%any play-pause      # front - play/pause
+
+# set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
+invert_sliders: false
+
+# settings for connecting to the arduino board
+com_port: /dev/deej
+baud_rate: 9600
+
+# adjust the amount of signal noise reduction depending on your hardware quality
+# supported values are "low" (excellent hardware), "default" (regular hardware) or "high" (bad, noisy hardware)
+noise_reduction: low
+
+# how often deej re-asserts slider volumes against apps that reset their own OS-level volume (e.g. Spotify, Firefox).
+# remove or set to 0 to disable. valid units: ms, s, m  (e.g. "500ms", "1s")
+volume_watchdog_interval: "500ms"
