@@ -84,7 +84,7 @@ running state and reading it gets the answer backwards.
   stays open, so with Music Assistant's Sendspin player added, `spotify` first
   would win even while Music Assistant was the one playing. `deej-media` sends
   to whichever of the two reports `Playing`, and only falls back to the
-  priority list when neither does. Sendspin's MPRIS name carries the pid
+  priority list (`Sendspin,spotify,%any`) when neither does. Sendspin's MPRIS name carries the pid
   (`Sendspin.instance<pid>`); `-p Sendspin` matches any instance.
 - **The Antlion is wireless and vanishes from PipeWire when switched off.** The
   toggle checks its target exists before switching, rather than leaving you on a

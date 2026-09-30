@@ -49,8 +49,8 @@ slider_mapping:
 button_mapping:
   8: ydotool key 186:1 186:0                   # back  - F16 -> discord mic mute
   7: /home/beqren/.local/bin/deej-mic-toggle   #       - swap desk mic <-> wireless
-  # Whichever of Spotify / Music Assistant (Sendspin) is playing, else Spotify,
-  # then Music Assistant, then anything. Bare playerctl follows whichever player
+  # Whichever of Music Assistant (Sendspin) / Spotify is playing, else Music
+  # Assistant, then Spotify, then anything. Bare playerctl follows whichever player
   # was last active, which sounds smarter and isn't: with a YouTube tab open,
   # these buttons silently start controlling Firefox instead. See deej-media.
   6: /home/beqren/.local/bin/deej-media next         #       - next track
