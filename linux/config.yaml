@@ -49,13 +49,12 @@ slider_mapping:
 button_mapping:
   8: ydotool key 186:1 186:0                   # back  - F16 -> discord mic mute
   7: /home/beqren/.local/bin/deej-mic-toggle   #       - swap desk mic <-> wireless
-  # Spotify first, then anything else. Bare playerctl follows whichever player
+  # Whichever of Spotify / Music Assistant (Sendspin) is playing, else Spotify,
+  # then Music Assistant, then anything. Bare playerctl follows whichever player
   # was last active, which sounds smarter and isn't: with a YouTube tab open,
-  # these buttons silently start controlling Firefox instead. The comma list is
-  # a priority order and %any is the fallback, so Spotify wins whenever it's
-  # running and a browser tab still works when it isn't.
-  6: playerctl -p spotify,%any next            #       - next track
-  5: playerctl -p spotify,%any play-pause      # front - play/pause
+  # these buttons silently start controlling Firefox instead. See deej-media.
+  6: /home/beqren/.local/bin/deej-media next         #       - next track
+  5: /home/beqren/.local/bin/deej-media play-pause   # front - play/pause
 
 # set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
 invert_sliders: false

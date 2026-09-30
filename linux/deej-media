@@ -1,0 +1,32 @@
+#!/bin/sh
+# Media buttons: send play-pause / next to the player you're actually listening to.
+#
+#   deej-media play-pause | next
+#
+# Two music players now live on this desktop: Spotify, and Music Assistant's
+# Sendspin daemon (MPRIS name Sendspin.instance<pid> - the pid changes every
+# restart, but `-p Sendspin` matches any instance). A fixed priority list can't
+# pick between them: Spotify stays open, so `-p spotify,Sendspin` would always
+# hit Spotify even while Music Assistant is the one playing.
+#
+# So: whichever of the two is Playing wins. With neither playing, fall back to
+# the old order - Spotify, then Music Assistant, then anything (%any keeps a
+# browser tab working when neither app is running). Firefox is deliberately
+# never preferred over a music player; see README on bare playerctl.
+
+cmd=$1
+case $cmd in
+play-pause | next) ;;
+*)
+	echo "usage: $0 play-pause|next" >&2
+	exit 2
+	;;
+esac
+
+for p in spotify Sendspin; do
+	if [ "$(playerctl -p "$p" status 2>/dev/null)" = Playing ]; then
+		exec playerctl -p "$p" "$cmd"
+	fi
+done
+
+exec playerctl -p spotify,Sendspin,%any "$cmd"

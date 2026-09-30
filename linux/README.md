@@ -9,6 +9,7 @@ tried, not the first.
 |---|---|
 | `config.yaml` | `/opt/deej/config.yaml` |
 | `deej-mic-toggle` | `~/.local/bin/deej-mic-toggle` |
+| `deej-media` | `~/.local/bin/deej-media` |
 | `systemd/ydotoold.service` | `~/.config/systemd/user/ydotoold.service` |
 | `systemd/deej.service.d/10-ydotool.conf` | `~/.config/systemd/user/deej.service.d/` |
 
@@ -79,6 +80,12 @@ running state and reading it gets the answer backwards.
   recently active player, which sounds smarter and isn't — with a YouTube tab
   open the media buttons silently control Firefox. The comma list is a priority
   order and `%any` is the fallback.
+- **...but a priority list can't choose between two music players.** Spotify
+  stays open, so with Music Assistant's Sendspin player added, `spotify` first
+  would win even while Music Assistant was the one playing. `deej-media` sends
+  to whichever of the two reports `Playing`, and only falls back to the
+  priority list when neither does. Sendspin's MPRIS name carries the pid
+  (`Sendspin.instance<pid>`); `-p Sendspin` matches any instance.
 - **The Antlion is wireless and vanishes from PipeWire when switched off.** The
   toggle checks its target exists before switching, rather than leaving you on a
   mic that isn't there.
