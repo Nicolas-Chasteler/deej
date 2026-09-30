@@ -90,3 +90,10 @@ running state and reading it gets the answer backwards.
   format to carry both halves.
 - **Config reloads live.** Reassigning a button is a one-line edit with no
   restart. Reflashing is only needed to add a switch or move a pin.
+- **Sliders match the PipeWire client's `application.process.binary`.** For
+  interpreted apps that's the interpreter, which is useless as a name. The
+  Music Assistant player (Sendspin, a Python daemon) showed up as `python3.14`.
+  Its user unit sets `PULSE_PROP=application.process.binary=sendspin`. libpulse
+  only fills that key in when it isn't already set, so the override sticks.
+  That puts it on slider 2 next to Spotify. The stream only exists while
+  something is playing, so check `pw-dump` during playback.

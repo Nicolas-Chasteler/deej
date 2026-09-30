@@ -11,7 +11,11 @@ slider_mapping:
   1:
     - firefox
     - jellyfinmediaplayer
-  2: spotify
+  # sendspin = the Music Assistant player (~/.config/systemd/user/sendspin.service
+  # sets its PipeWire process.binary to "sendspin"; the real one is python3.14).
+  2:
+    - spotify
+    - sendspin
   3: discord
   4: deej.unmapped
 
