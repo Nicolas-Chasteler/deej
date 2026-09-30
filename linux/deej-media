@@ -11,8 +11,8 @@
 #
 # So: whichever of the two is Playing wins. With neither playing, fall back to
 # Music Assistant, then Spotify, then anything (%any keeps a browser tab working
-# when neither app is running). Firefox is deliberately
-# never preferred over a music player; see README on bare playerctl.
+# when neither app is running). Firefox is deliberately never preferred over a
+# music player; see README on bare playerctl.
 
 cmd=$1
 case $cmd in
