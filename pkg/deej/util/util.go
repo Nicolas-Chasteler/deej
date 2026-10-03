@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -39,7 +41,9 @@ func Linux() bool {
 // SetupCloseHandler creates a 'listener' on a new goroutine which will notify the
 // program if it receives an interrupt from the OS
 func SetupCloseHandler() chan os.Signal {
-	c := make(chan os.Signal)
+	// buffered, as signal.Notify requires: it never blocks to deliver, so a
+	// signal arriving while nobody is receiving would otherwise be dropped
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	return c
@@ -52,18 +56,20 @@ func GetCurrentWindowProcessNames() ([]string, error) {
 	return getCurrentWindowProcessNames()
 }
 
-// OpenExternal spawns a detached window with the provided command and argument
+// OpenExternal spawns a detached window with the provided command and argument.
+// It returns once the process has started, not when it exits - the tray calls
+// this from its event loop, which mustn't stay blocked while an editor is open
 func OpenExternal(logger *zap.SugaredLogger, cmd string, arg string) error {
 
-	// use cmd for windows, bash for linux
+	// use cmd for windows, run the opener directly on linux
 	execCommandArgs := []string{"cmd.exe", "/C", "start", "/b", cmd, arg}
 	if Linux() {
-		execCommandArgs = []string{"/bin/bash", "-c", fmt.Sprintf("%s %s", cmd, arg)}
+		execCommandArgs = []string{cmd, arg}
 	}
 
 	command := exec.Command(execCommandArgs[0], execCommandArgs[1:]...)
 
-	if err := command.Run(); err != nil {
+	if err := command.Start(); err != nil {
 		logger.Warnw("Failed to spawn detached process",
 			"command", cmd,
 			"argument", arg,
@@ -72,22 +78,32 @@ func OpenExternal(logger *zap.SugaredLogger, cmd string, arg string) error {
 		return fmt.Errorf("spawn detached proc: %w", err)
 	}
 
+	// reap it whenever it exits
+	go command.Wait()
+
 	return nil
 }
 
 // RunShellCommand runs the given command line through the platform's shell and
 // waits for it to finish, returning its combined output for logging purposes.
+// If ctx ends first the command is killed, along with anything it started.
 //
 // Unlike OpenExternal this takes a whole command line rather than a command and
 // a single argument, because it's fed straight from the user's config - letting
 // the shell do the word splitting is the whole point.
-func RunShellCommand(commandLine string) ([]byte, error) {
+func RunShellCommand(ctx context.Context, commandLine string) ([]byte, error) {
 	execCommandArgs := []string{"cmd.exe", "/C", commandLine}
 	if Linux() {
 		execCommandArgs = []string{"/bin/sh", "-c", commandLine}
 	}
 
-	command := exec.Command(execCommandArgs[0], execCommandArgs[1:]...)
+	command := exec.CommandContext(ctx, execCommandArgs[0], execCommandArgs[1:]...)
+	killProcessTreeOnCancel(command)
+
+	// a child that's been backgrounded can hold our output pipe open after the
+	// shell exits, which would keep Wait from returning. give up on the pipe
+	// shortly after the process itself is done or killed
+	command.WaitDelay = time.Second
 
 	output, err := command.CombinedOutput()
 	if err != nil {

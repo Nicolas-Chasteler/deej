@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# run from the repo root wherever this was invoked from - the build needs
+# ./pkg/deej/cmd and git needs to be inside the tree
+cd "$(dirname "$0")/../../../.." || exit 1
+
 echo 'Building deej (release)...'
 
 # shove git commit, version tag into env
@@ -15,7 +19,7 @@ go build -o deej-release -ldflags "-s -w -X main.gitCommit=$GIT_COMMIT -X main.v
 if [ $? -eq 0 ]; then
     echo 'Done.'
 else
-    echo 'Error: "go build" exited with a non-zero code. Are you running this script from the root deej directory?'
+    echo 'Error: "go build" exited with a non-zero code.'
     exit 1
 fi
 

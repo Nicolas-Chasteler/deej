@@ -9,20 +9,23 @@ import (
 )
 
 const (
-	buildTypeNone    = ""
 	buildTypeDev     = "dev"
 	buildTypeRelease = "release"
 
-	// logDirectory is kept for crash logs (panic.go) and internal config path (config.go)
+	// logDirectory holds the internal config (config.go)
 	logDirectory = "logs"
 )
 
-// NewLogger provides a logger instance for the whole program
-func NewLogger(buildType string) (*zap.SugaredLogger, error) {
+// NewLogger provides a logger instance for the whole program. Anything that
+// isn't explicitly a dev build gets the quiet release logger - a plain
+// "go build" used to fall through to debug level with colour codes and a stack
+// trace on every warning, all of it landing in the journal. --verbose asks for
+// the debug logger regardless of build type.
+func NewLogger(buildType string, verbose bool) (*zap.SugaredLogger, error) {
 	var loggerConfig zap.Config
 
 	// release: info and above, log to stderr (captured by systemd/journald)
-	if buildType == buildTypeRelease {
+	if buildType != buildTypeDev && !verbose {
 		loggerConfig = zap.NewProductionConfig()
 
 		loggerConfig.OutputPaths = []string{"stderr"}

@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"runtime/debug"
 
 	"github.com/omriharel/deej/pkg/deej"
 )
@@ -23,8 +24,14 @@ func init() {
 
 func main() {
 
+	// a plain "go build" doesn't run the build scripts, so nothing set these.
+	// the Go toolchain stamps the commit into the binary regardless
+	if gitCommit == "" {
+		gitCommit = commitFromBuildInfo()
+	}
+
 	// first we need a logger
-	logger, err := deej.NewLogger(buildType)
+	logger, err := deej.NewLogger(buildType, verbose)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create logger: %v", err))
 	}
@@ -63,4 +70,35 @@ func main() {
 	if err = d.Initialize(); err != nil {
 		named.Fatalw("Failed to initialize deej", "error", err)
 	}
+}
+
+// commitFromBuildInfo returns the short commit the binary was built from, with
+// "-dirty" if the tree had uncommitted changes, or "" if it wasn't recorded
+func commitFromBuildInfo() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+
+	var revision string
+	var modified bool
+
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+
+	if len(revision) > 7 {
+		revision = revision[:7]
+	}
+
+	if revision != "" && modified {
+		revision += "-dirty"
+	}
+
+	return revision
 }

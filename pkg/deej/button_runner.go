@@ -1,7 +1,9 @@
 package deej
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,12 +16,17 @@ import (
 type buttonRunner struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
+
+	// buttons whose command is still running. a second press of the same button
+	// meanwhile is dropped: two deej-mic-toggle runs at once would each read the
+	// state the other is halfway through changing
+	runningLock sync.Mutex
+	running     map[int]bool
 }
 
-// commandTimeout bounds how long a button's command is allowed to run before we
-// stop waiting on it and log a warning. The command isn't killed - this only
-// stops a hung command from occupying its goroutine forever without anyone
-// noticing. Anything long-running belongs behind a launcher anyway.
+// commandTimeout bounds how long a button's command may run before it's killed,
+// along with anything it started. Button commands are meant to be quick
+// actions; anything long-running belongs behind a launcher.
 const commandTimeout = 10 * time.Second
 
 func newButtonRunner(deej *Deej, logger *zap.SugaredLogger) *buttonRunner {
@@ -28,8 +35,9 @@ func newButtonRunner(deej *Deej, logger *zap.SugaredLogger) *buttonRunner {
 	logger.Debug("Created button runner instance")
 
 	return &buttonRunner{
-		deej:   deej,
-		logger: logger,
+		deej:    deej,
+		logger:  logger,
+		running: make(map[int]bool),
 	}
 }
 
@@ -49,37 +57,65 @@ func (r *buttonRunner) initialize() {
 }
 
 func (r *buttonRunner) runCommand(event ButtonPressEvent) {
+	if !r.claim(event.ButtonID) {
+		r.logger.Infow("Button's previous command is still running, ignoring press",
+			"button", event.ButtonID,
+			"command", event.Command)
+
+		return
+	}
+
+	defer r.release(event.ButtonID)
+
 	r.logger.Infow("Running button command", "button", event.ButtonID, "command", event.Command)
 
-	done := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
 
-	go func() {
-		defer close(done)
+	output, err := util.RunShellCommand(ctx, event.Command)
 
-		output, err := util.RunShellCommand(event.Command)
-		if err != nil {
-			r.logger.Warnw("Button command failed",
-				"button", event.ButtonID,
-				"command", event.Command,
-				"error", err,
-				"output", strings.TrimSpace(string(output)))
-
-			return
-		}
-
-		if r.deej.Verbose() {
-			r.logger.Debugw("Button command finished",
-				"button", event.ButtonID,
-				"output", strings.TrimSpace(string(output)))
-		}
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(commandTimeout):
-		r.logger.Warnw("Button command is still running, no longer waiting on it",
+	if ctx.Err() == context.DeadlineExceeded {
+		r.logger.Warnw("Button command timed out and was killed",
 			"button", event.ButtonID,
 			"command", event.Command,
 			"timeout", commandTimeout)
+
+		return
 	}
+
+	if err != nil {
+		r.logger.Warnw("Button command failed",
+			"button", event.ButtonID,
+			"command", event.Command,
+			"error", err,
+			"output", strings.TrimSpace(string(output)))
+
+		return
+	}
+
+	if r.deej.Verbose() {
+		r.logger.Debugw("Button command finished",
+			"button", event.ButtonID,
+			"output", strings.TrimSpace(string(output)))
+	}
+}
+
+func (r *buttonRunner) claim(buttonID int) bool {
+	r.runningLock.Lock()
+	defer r.runningLock.Unlock()
+
+	if r.running[buttonID] {
+		return false
+	}
+
+	r.running[buttonID] = true
+
+	return true
+}
+
+func (r *buttonRunner) release(buttonID int) {
+	r.runningLock.Lock()
+	defer r.runningLock.Unlock()
+
+	delete(r.running, buttonID)
 }

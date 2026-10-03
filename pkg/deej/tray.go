@@ -17,7 +17,7 @@ func (d *Deej) initializeTray(onDone func()) {
 		systray.SetTitle("deej")
 		systray.SetTooltip("deej")
 
-		editConfig := systray.AddMenuItem("Edit configuration", "Open config file with notepad")
+		editConfig := systray.AddMenuItem("Edit configuration", "Open config file in your editor")
 		editConfig.SetIcon(icon.EditConfig)
 
 		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions if something's stuck")
@@ -47,9 +47,11 @@ func (d *Deej) initializeTray(onDone func()) {
 				case <-editConfig.ClickedCh:
 					logger.Info("Edit config menu item clicked, opening config for editing")
 
+					// xdg-open hands it to whatever the desktop has set for YAML
+					// rather than assuming an editor is installed
 					editor := "notepad.exe"
 					if util.Linux() {
-						editor = "gedit"
+						editor = "xdg-open"
 					}
 
 					if err := util.OpenExternal(logger, editor, userConfigFilepath); err != nil {
