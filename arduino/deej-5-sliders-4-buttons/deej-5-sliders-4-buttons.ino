@@ -46,7 +46,13 @@ void setup() {
     buttonLastChangeMs[i] = 0;
   }
 
-  Serial.begin(9600);
+  // 115200 rather than deej's usual 9600. A full line is up to 46 bytes, which
+  // takes ~48ms at 9600 - longer than the loop - so println blocked on a full
+  // transmit buffer and the loop really ran every 30-50ms. Buttons were only
+  // sampled that often, a quick tap could fall between samples, and the 25ms
+  // debounce amounted to "same reading twice". baud_rate in config.yaml has to
+  // match.
+  Serial.begin(115200);
 }
 
 void loop() {
@@ -85,22 +91,23 @@ void updateButtonStates() {
 }
 
 void sendValues() {
-  String builtString = String("");
+  // built in a fixed buffer rather than with String concatenation, which
+  // reallocates on the AVR's 2KB heap every loop. 9 values of up to 4 digits
+  // plus separators is 44 characters
+  char line[64];
+  int length = 0;
 
   for (int i = 0; i < NUM_SLIDERS; i++) {
-    builtString += String((int)analogSliderValues[i]);
-    builtString += String("|");
+    length += snprintf(line + length, sizeof(line) - length, "%d|", analogSliderValues[i]);
   }
 
   for (int i = 0; i < NUM_BUTTONS; i++) {
-    builtString += String(buttonStableStates[i] ? 1023 : 0);
-
-    if (i < NUM_BUTTONS - 1) {
-      builtString += String("|");
-    }
+    length += snprintf(line + length, sizeof(line) - length,
+                       i < NUM_BUTTONS - 1 ? "%d|" : "%d",
+                       buttonStableStates[i] ? 1023 : 0);
   }
 
-  Serial.println(builtString);
+  Serial.println(line);
 }
 
 void printValues() {
