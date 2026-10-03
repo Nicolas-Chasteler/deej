@@ -10,17 +10,46 @@ tried, not the first.
 | `config.yaml` | `/opt/deej/config.yaml` |
 | `deej-mic-toggle` | `~/.local/bin/deej-mic-toggle` |
 | `deej-media` | `~/.local/bin/deej-media` |
-| `systemd/ydotoold.service` | `~/.config/systemd/user/ydotoold.service` |
+| `systemd/deej.service` | `~/.config/systemd/user/deej.service` |
 | `systemd/deej.service.d/10-ydotool.conf` | `~/.config/systemd/user/deej.service.d/` |
+| `systemd/ydotoold.service` | `~/.config/systemd/user/ydotoold.service` |
+| `udev/99-deej.rules` | `/etc/udev/rules.d/99-deej.rules` |
 
-The binary is built from this tree and copied to `/opt/deej/deej`. That file is
-root-owned but the directory isn't, so replacing it means `rm` then `cp` — a
-plain `cp` over the top gets permission denied.
+The binary is built with `pkg/deej/scripts/linux/build-release.sh` and copied
+to `/opt/deej/deej`: `rm` the old one, then `cp`, because a `cp` over a running
+binary fails with "text file busy". Use the release script rather than a bare
+`go build` — the scripts embed the version, and a dev build logs at debug level.
+
+`config.yaml` is mode 644 on purpose. It reloads live and its button commands
+run through `/bin/sh` as you, so anything that can write to it can run commands
+as you.
+
+## Failure handling
+
+- **Box unplugged:** deej keeps running, logs one warning, and reopens the port
+  when it comes back. A missing port at startup is handled the same way — one
+  notification, then retries every 2s. Nothing restarts the service for this.
+- **Audio server restarted:** the PulseAudio connection can't be revived, so
+  deej exits 1 and `Restart=on-failure` brings it back against the new server.
+- **Quit from the tray** exits 0 and stays quit. That's why the unit uses
+  `on-failure` and not `always`.
 
 ## The hardware
 
 Five sliders on A0–A4, four MX switches on D2–D5, an Arduino Nano (A000005).
-Sketch is `arduino/deej-5-sliders-4-buttons`. Switches arrive as extra channels
+Sketch is `arduino/deej-5-sliders-4-buttons`, at **115200 baud** — `baud_rate`
+in the config has to match. Flash it with deej stopped, since the upload needs
+the port:
+
+```
+systemctl --user stop deej
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328 arduino/deej-5-sliders-4-buttons
+arduino-cli upload -p /dev/ttyUSB0 --fqbn arduino:avr:nano:cpu=atmega328 arduino/deej-5-sliders-4-buttons
+systemctl --user start deej
+```
+
+At 9600 a full line took longer to send than the loop, so the loop actually ran
+every 30–50ms and a quick tap could fall between button samples. Switches arrive as extra channels
 appended after the sliders, so they're channels 5–8, and a pressed one reports
 1023.
 
@@ -88,13 +117,19 @@ running state and reading it gets the answer backwards.
   (`Sendspin.instance<pid>`); `-p Sendspin` matches any instance.
 - **The Antlion is wireless and vanishes from PipeWire when switched off.** The
   toggle checks its target exists before switching, rather than leaving you on a
-  mic that isn't there.
+  mic that isn't there. It also refuses to run without EasyEffects, and only
+  claims success once EasyEffects has actually picked up the new mic.
 - **Input volumes are per-device and persist.** WirePlumber keeps them in
   `default-routes`, so the Antlion's 82% trim (matching it to the PCM2902)
   survives swapping and reboots. The toggle never touches volumes.
 - **Buttons fire on the rising edge only.** There's no release event, so
   push-to-talk isn't possible without changing `serial.go` and the mapping
-  format to carry both halves.
+  format to carry both halves. A command gets 10s before it's killed, and a
+  second press of the same button while its command is still running is
+  ignored.
+- **The master and mic sliders follow the default device.** They address
+  `@DEFAULT_SINK@`/`@DEFAULT_SOURCE@`, so a headset connecting or the default
+  changing needs no refresh.
 - **Config reloads live.** Reassigning a button is a one-line edit with no
   restart. Reflashing is only needed to add a switch or move a pin.
 - **Sliders match the PipeWire client's `application.process.binary`.** For

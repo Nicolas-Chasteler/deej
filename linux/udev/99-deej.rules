@@ -1,0 +1,6 @@
+# Gives the box a stable name, whatever ttyUSB number it lands on. Matched on the
+# FTDI chip's serial number so another FTDI adapter can't take the name.
+#
+# There used to be a second rule here that restarted deej on every add event.
+# deej reopens the port itself when it reappears now, so that's gone.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="B003OADX", SYMLINK+="deej"

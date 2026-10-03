@@ -25,6 +25,14 @@ notify() {
     notify-send -a deej -t 2500 -i audio-input-microphone "Microphone" "$1"
 }
 
+# Without EasyEffects there's no chain to retarget, and the two-step below
+# would leave the default on raw hardware - exactly the state it exists to
+# avoid. Check for its node rather than the process: the node is what matters.
+if ! pactl list short sources | cut -f2 | grep -qx "$PROCESSED"; then
+    notify "EasyEffects isn't running - not switching"
+    exit 1
+fi
+
 # Which hardware device currently feeds the EasyEffects input chain. Read from
 # the live graph rather than from config, which lags behind the running state.
 #
@@ -51,12 +59,25 @@ fi
 pactl set-default-source "$target" || exit 1
 
 # EasyEffects needs a moment to notice the default moved and rebuild the chain.
+switched=false
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.3
     if pw-link -l 2>/dev/null | grep -A2 "^$target" | grep -q ee_sie_; then
+        switched=true
         break
     fi
 done
 
-pactl set-default-source "$PROCESSED"
+# Hand the default back whether or not the switch took, so apps following the
+# default never stay on the raw mic. If this fails they would, so say so.
+if ! pactl set-default-source "$PROCESSED"; then
+    notify "Couldn't restore the default to EasyEffects - apps may be on the raw mic"
+    exit 1
+fi
+
+if [ "$switched" != true ]; then
+    notify "EasyEffects didn't pick up $label - still on the previous mic"
+    exit 1
+fi
+
 notify "$label"
