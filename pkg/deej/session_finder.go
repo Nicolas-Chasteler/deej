@@ -8,5 +8,9 @@ type SessionFinder interface {
 	// audio session is detected. Callers should refresh sessions on each signal.
 	NewSessionChannel() <-chan struct{}
 
+	// ConnectionLost returns a channel that's closed if the connection to the
+	// audio server dies for good. A nil channel means the finder can't tell.
+	ConnectionLost() <-chan struct{}
+
 	Release() error
 }

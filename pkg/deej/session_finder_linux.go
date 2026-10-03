@@ -2,6 +2,7 @@ package deej
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -22,10 +23,10 @@ type pwDumpNode struct {
 
 // PulseAudio subscription event bit masks
 const (
-	paEventFacilityMask  = 0x000F
-	paEventFacilitySinkInput = 0x0002
-	paEventTypeMask      = 0x0030
-	paEventTypeNew       = 0x0000
+	paEventFacilityMask         = 0x000F
+	paEventFacilitySinkInput    = 0x0002
+	paEventTypeMask             = 0x0030
+	paEventTypeNew              = 0x0000
 	paSubscriptionMaskSinkInput = 0x0004
 )
 
@@ -33,7 +34,7 @@ type paSessionFinder struct {
 	logger        *zap.SugaredLogger
 	sessionLogger *zap.SugaredLogger
 
-	client       *proto.Client
+	client       *paClient
 	conn         net.Conn
 	newSessionCh chan struct{}
 }
@@ -59,14 +60,24 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	sf := &paSessionFinder{
 		logger:        logger.Named("session_finder"),
 		sessionLogger: logger.Named("sessions"),
-		client:        client,
 		conn:          conn,
 		newSessionCh:  make(chan struct{}, 1),
 	}
 
+	sf.client = newPAClient(client, sf.logger)
+
 	// subscribe to sink input events so we're notified the moment a new audio
-	// stream opens, rather than waiting for the next polling cycle
+	// stream opens, rather than waiting for the next polling cycle. this runs on
+	// the client's read loop, so it must never block
 	client.Callback = func(msg interface{}) {
+
+		// the library only reports a clean EOF here. other transport errors
+		// surface through the next request, which paClient also watches
+		if _, closed := msg.(*proto.ConnectionClosed); closed {
+			sf.client.markLost(errors.New("connection closed by server"))
+			return
+		}
+
 		event, ok := msg.(*proto.SubscribeEvent)
 		if !ok {
 			return
@@ -82,7 +93,7 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 		}
 	}
 
-	if err := client.Request(&proto.Subscribe{Mask: paSubscriptionMaskSinkInput}, nil); err != nil {
+	if err := sf.client.Request(&proto.Subscribe{Mask: paSubscriptionMaskSinkInput}, nil); err != nil {
 		sf.logger.Warnw("Failed to subscribe to PulseAudio events (non-fatal)", "error", err)
 	}
 
@@ -92,22 +103,12 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 }
 
 func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
-	sessions := []Session{}
 
-	// get the master sink session
-	masterSink, err := sf.getMasterSinkSession()
-	if err == nil {
-		sessions = append(sessions, masterSink)
-	} else {
-		sf.logger.Warnw("Failed to get master audio sink session", "error", err)
-	}
-
-	// get the master source session
-	masterSource, err := sf.getMasterSourceSession()
-	if err == nil {
-		sessions = append(sessions, masterSource)
-	} else {
-		sf.logger.Warnw("Failed to get master audio source session", "error", err)
+	// the master and mic sessions address whichever device is default at the
+	// time of each request, so they need nothing looked up here
+	sessions := []Session{
+		newMasterSession(sf.sessionLogger, sf.client, true),
+		newMasterSession(sf.sessionLogger, sf.client, false),
 	}
 
 	// enumerate sink inputs and add sessions along the way
@@ -116,21 +117,22 @@ func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 		return nil, fmt.Errorf("enumerate audio sessions: %w", err)
 	}
 
-	// build a set of process names already found via PulseAudio to avoid duplicates
-	existingNames := make(map[string]bool)
+	// the process names already found via PulseAudio, so the PipeWire pass
+	// doesn't add a second session for the same app
+	pulseNames := make(map[string]bool)
 	for _, s := range sessions {
-		existingNames[s.Key()] = true
+		pulseNames[s.Key()] = true
 	}
 
 	// enumerate native PipeWire sessions (apps that bypass PulseAudio entirely)
-	if err := sf.enumeratePipeWireSessions(&sessions, existingNames); err != nil {
+	if err := sf.enumeratePipeWireSessions(&sessions, pulseNames); err != nil {
 		sf.logger.Warnw("Failed to enumerate PipeWire sessions (non-fatal)", "error", err)
 	}
 
 	return sessions, nil
 }
 
-func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existingNames map[string]bool) error {
+func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, pulseNames map[string]bool) error {
 	out, err := exec.Command("pw-dump").Output()
 	if err != nil {
 		return fmt.Errorf("run pw-dump: %w", err)
@@ -188,8 +190,10 @@ func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existi
 
 		nameLower := strings.ToLower(name)
 
-		// skip anything already handled by PulseAudio (or a previous PW iteration)
-		if existingNames[nameLower] {
+		// skip anything already handled by PulseAudio. an app with several native
+		// streams gets a session for each - they share a key, like any other
+		// multi-stream app, so one slider drives them all
+		if pulseNames[nameLower] {
 			continue
 		}
 
@@ -197,7 +201,6 @@ func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existi
 
 		newSession := newPipewireSession(sf.sessionLogger, node.ID, name)
 		*sessions = append(*sessions, newSession)
-		existingNames[nameLower] = true
 	}
 
 	return nil
@@ -205,6 +208,10 @@ func (sf *paSessionFinder) enumeratePipeWireSessions(sessions *[]Session, existi
 
 func (sf *paSessionFinder) NewSessionChannel() <-chan struct{} {
 	return sf.newSessionCh
+}
+
+func (sf *paSessionFinder) ConnectionLost() <-chan struct{} {
+	return sf.client.lost
 }
 
 func (sf *paSessionFinder) Release() error {
@@ -216,40 +223,6 @@ func (sf *paSessionFinder) Release() error {
 	sf.logger.Debug("Released PA session finder instance")
 
 	return nil
-}
-
-func (sf *paSessionFinder) getMasterSinkSession() (Session, error) {
-	request := proto.GetSinkInfo{
-		SinkIndex: proto.Undefined,
-	}
-	reply := proto.GetSinkInfoReply{}
-
-	if err := sf.client.Request(&request, &reply); err != nil {
-		sf.logger.Warnw("Failed to get master sink info", "error", err)
-		return nil, fmt.Errorf("get master sink info: %w", err)
-	}
-
-	// create the master sink session
-	sink := newMasterSession(sf.sessionLogger, sf.client, reply.SinkIndex, reply.Channels, true)
-
-	return sink, nil
-}
-
-func (sf *paSessionFinder) getMasterSourceSession() (Session, error) {
-	request := proto.GetSourceInfo{
-		SourceIndex: proto.Undefined,
-	}
-	reply := proto.GetSourceInfoReply{}
-
-	if err := sf.client.Request(&request, &reply); err != nil {
-		sf.logger.Warnw("Failed to get master source info", "error", err)
-		return nil, fmt.Errorf("get master source info: %w", err)
-	}
-
-	// create the master source session
-	source := newMasterSession(sf.sessionLogger, sf.client, reply.SourceIndex, reply.Channels, false)
-
-	return source, nil
 }
 
 func (sf *paSessionFinder) enumerateAndAddSessions(sessions *[]Session) error {

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jacobsa/go-serial/serial"
@@ -18,18 +21,33 @@ import (
 
 // SerialIO provides a deej-aware abstraction layer to managing serial I/O
 type SerialIO struct {
-	comPort  string
-	baudRate uint
-
 	deej   *Deej
 	logger *zap.SugaredLogger
 
-	stopChannel chan bool
-	connected   bool
-	connOptions serial.OpenOptions
-	conn        io.ReadWriteCloser
+	// closed by Stop. the connection goroutine owns the port and everything
+	// below that isn't explicitly locked, so shutting down is just this
+	stopChannel chan struct{}
+	stopOnce    sync.Once
+	startOnce   sync.Once
 
-	lastKnownNumSliders        int
+	// signalled when the config reloads. buffered so the config watcher never
+	// waits on a connection goroutine that's busy delivering a line
+	configReloaded chan struct{}
+
+	// set on config reload so the next line re-emits every slider. it's an
+	// atomic flag rather than a reset of the slider count so that buttons keep
+	// their held state - re-zeroing them made any held button fire again
+	resendSliders atomic.Bool
+
+	// channel count the arduino has settled on, plus a candidate replacement
+	// that has to repeat before we believe it. owned by the connection goroutine
+	lastKnownNumSliders int
+	pendingNumSliders   int
+	pendingCount        int
+
+	// read by the volume watchdog and new-session goroutines via
+	// CurrentSliderValues while the connection goroutine writes it
+	valuesLock                 sync.Mutex
 	currentSliderPercentValues []float32
 
 	// currentButtonStates tracks whether each button channel is currently held
@@ -37,6 +55,7 @@ type SerialIO struct {
 	// themselves; entries for slider channels are meaningless
 	currentButtonStates []bool
 
+	// set up before Start and never changed afterwards
 	sliderMoveConsumers  []chan SliderMoveEvent
 	buttonPressConsumers []chan ButtonPressEvent
 }
@@ -57,10 +76,26 @@ type ButtonPressEvent struct {
 // them with hysteresis so a channel resting near the middle (a floating pin, or
 // a slider someone mapped as a button by mistake) can't oscillate: it takes a
 // clear high to register a press and a clear low to release it again.
-// contact bounce is handled on the arduino side, where the timing lives
+// contact bounce is handled on the arduino side, where the timing authority lives
 const (
 	buttonPressedThreshold  = 700
 	buttonReleasedThreshold = 300
+)
+
+const (
+
+	// how long to wait between attempts to open the port while it's missing or
+	// busy - the box being unplugged is a normal state, not an error to exit on
+	reconnectInterval = 2 * time.Second
+
+	// a different channel count has to show up on this many consecutive lines
+	// before we accept it. a single line that lost a separator in transit would
+	// otherwise shift every later channel down one, sending a button's 1023 to a
+	// slider and making a held button look newly pressed
+	channelCountConfirmations = 3
+
+	// the largest value analogRead can produce
+	maxRawValue = 1023
 )
 
 var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
@@ -73,9 +108,8 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	sio := &SerialIO{
 		deej:                 deej,
 		logger:               logger,
-		stopChannel:          make(chan bool),
-		connected:            false,
-		conn:                 nil,
+		stopChannel:          make(chan struct{}),
+		configReloaded:       make(chan struct{}, 1),
 		sliderMoveConsumers:  []chan SliderMoveEvent{},
 		buttonPressConsumers: []chan ButtonPressEvent{},
 	}
@@ -88,89 +122,39 @@ func NewSerialIO(deej *Deej, logger *zap.SugaredLogger) (*SerialIO, error) {
 	return sio, nil
 }
 
-// Start attempts to connect to our arduino chip
-func (sio *SerialIO) Start() error {
-
-	// don't allow multiple concurrent connections
-	if sio.connected {
-		sio.logger.Warn("Already connected, can't start another without closing first")
-		return errors.New("serial: connection already active")
-	}
-
-	// set minimum read size according to platform (0 for windows, 1 for linux)
-	// this prevents a rare bug on windows where serial reads get congested,
-	// resulting in significant lag
-	minimumReadSize := 0
-	if util.Linux() {
-		minimumReadSize = 1
-	}
-
-	sio.connOptions = serial.OpenOptions{
-		PortName:        sio.deej.config.ConnectionInfo.COMPort,
-		BaudRate:        uint(sio.deej.config.ConnectionInfo.BaudRate),
-		DataBits:        8,
-		StopBits:        1,
-		MinimumReadSize: uint(minimumReadSize),
-	}
-
-	sio.logger.Debugw("Attempting serial connection",
-		"comPort", sio.connOptions.PortName,
-		"baudRate", sio.connOptions.BaudRate,
-		"minReadSize", minimumReadSize)
-
-	var err error
-	sio.conn, err = serial.Open(sio.connOptions)
-	if err != nil {
-
-		// might need a user notification here, TBD
-		sio.logger.Warnw("Failed to open serial connection", "error", err)
-		return fmt.Errorf("open serial connection: %w", err)
-	}
-
-	namedLogger := sio.logger.Named(strings.ToLower(sio.connOptions.PortName))
-
-	namedLogger.Infow("Connected", "conn", sio.conn)
-	sio.connected = true
-
-	// read lines or await a stop
-	go func() {
-		connReader := bufio.NewReader(sio.conn)
-		lineChannel := sio.readLine(namedLogger, connReader)
-
-		for {
-			select {
-			case <-sio.stopChannel:
-				sio.close(namedLogger)
-			case line := <-lineChannel:
-				sio.handleLine(namedLogger, line)
-			}
-		}
-	}()
-
-	return nil
+// Start begins connecting to the arduino in the background. It keeps trying
+// until Stop is called: a missing or busy port is retried rather than fatal,
+// and a connection that drops (the box unplugged) is re-opened when the port
+// comes back.
+func (sio *SerialIO) Start() {
+	sio.startOnce.Do(func() {
+		go sio.connectionLoop()
+	})
 }
 
-// Stop signals us to shut down our serial connection, if one is active
+// Stop shuts down the serial connection, if there is one, and stops retrying
 func (sio *SerialIO) Stop() {
-	if sio.connected {
+	sio.stopOnce.Do(func() {
 		sio.logger.Debug("Shutting down serial connection")
-		sio.stopChannel <- true
-	} else {
-		sio.logger.Debug("Not currently connected, nothing to stop")
-	}
+		close(sio.stopChannel)
+	})
 }
 
 // CurrentSliderValues returns a copy of the last known slider percent values.
-// Returns nil if no values have been read yet.
+// Returns nil if no values have been read yet. Entries are -1 for sliders that
+// haven't reported since the last reset.
 func (sio *SerialIO) CurrentSliderValues() []float32 {
+	sio.valuesLock.Lock()
+	defer sio.valuesLock.Unlock()
+
 	if sio.currentSliderPercentValues == nil {
 		return nil
 	}
-	copy := make([]float32, len(sio.currentSliderPercentValues))
-	for i, v := range sio.currentSliderPercentValues {
-		copy[i] = v
-	}
-	return copy
+
+	values := make([]float32, len(sio.currentSliderPercentValues))
+	copy(values, sio.currentSliderPercentValues)
+
+	return values
 }
 
 // SubscribeToSliderMoveEvents returns an unbuffered channel that receives
@@ -200,81 +184,194 @@ func (sio *SerialIO) SubscribeToButtonPressEvents() chan ButtonPressEvent {
 func (sio *SerialIO) setupOnConfigReload() {
 	configReloadedChannel := sio.deej.config.SubscribeToChanges()
 
-	const stopDelay = 50 * time.Millisecond
-
 	go func() {
-		for {
+		for range configReloadedChannel {
+
+			// re-send every slider on the next line, so process volumes are
+			// re-applied against whatever the new mapping says
+			sio.resendSliders.Store(true)
+
+			// let the connection goroutine check whether the port or baud rate
+			// changed. non-blocking: one pending signal is as good as several
 			select {
-			case <-configReloadedChannel:
-
-				// make any config reload unset our slider number to ensure process volumes are being re-set
-				// (the next read line will emit SliderMoveEvent instances for all sliders)\
-				// this needs to happen after a small delay, because the session map will also re-acquire sessions
-				// whenever the config file is reloaded, and we don't want it to receive these move events while the map
-				// is still cleared. this is kind of ugly, but shouldn't cause any issues
-				go func() {
-					<-time.After(stopDelay)
-					sio.lastKnownNumSliders = 0
-				}()
-
-				// if connection params have changed, attempt to stop and start the connection
-				if sio.deej.config.ConnectionInfo.COMPort != sio.connOptions.PortName ||
-					uint(sio.deej.config.ConnectionInfo.BaudRate) != sio.connOptions.BaudRate {
-
-					sio.logger.Info("Detected change in connection parameters, attempting to renew connection")
-					sio.Stop()
-
-					// let the connection close
-					<-time.After(stopDelay)
-
-					if err := sio.Start(); err != nil {
-						sio.logger.Warnw("Failed to renew connection after parameter change", "error", err)
-					} else {
-						sio.logger.Debug("Renewed connection successfully")
-					}
-				}
+			case sio.configReloaded <- struct{}{}:
+			default:
 			}
 		}
 	}()
 }
 
-func (sio *SerialIO) close(logger *zap.SugaredLogger) {
-	if err := sio.conn.Close(); err != nil {
-		logger.Warnw("Failed to close serial connection", "error", err)
-	} else {
-		logger.Debug("Serial connection closed")
+func connOptionsFromConfig(info connectionInfo) serial.OpenOptions {
+
+	// set minimum read size according to platform (0 for windows, 1 for linux)
+	// this prevents a rare bug on windows where serial reads get congested,
+	// resulting in significant lag
+	minimumReadSize := 0
+	if util.Linux() {
+		minimumReadSize = 1
 	}
 
-	sio.conn = nil
-	sio.connected = false
+	return serial.OpenOptions{
+		PortName:        info.COMPort,
+		BaudRate:        uint(info.BaudRate),
+		DataBits:        8,
+		StopBits:        1,
+		MinimumReadSize: uint(minimumReadSize),
+	}
 }
 
-func (sio *SerialIO) readLine(logger *zap.SugaredLogger, reader *bufio.Reader) chan string {
-	ch := make(chan string)
+// connectionLoop owns the serial port for deej's whole lifetime: open it, read
+// until it fails or the config points somewhere else, close it, repeat.
+func (sio *SerialIO) connectionLoop() {
+	failedAttempts := 0
+
+	for {
+		connOptions := connOptionsFromConfig(sio.deej.config.current().ConnectionInfo)
+
+		sio.logger.Debugw("Attempting serial connection",
+			"comPort", connOptions.PortName,
+			"baudRate", connOptions.BaudRate,
+			"minReadSize", connOptions.MinimumReadSize)
+
+		conn, err := serial.Open(connOptions)
+		if err != nil {
+
+			// say so once per outage, not once per retry
+			if failedAttempts == 0 {
+				sio.logger.Warnw("Failed to open serial connection, will keep retrying",
+					"comPort", connOptions.PortName,
+					"error", err,
+					"retryInterval", reconnectInterval)
+
+				sio.deej.notifier.Notify(fmt.Sprintf("Can't connect to %s", connOptions.PortName),
+					serialOpenErrorHint(err))
+			}
+
+			failedAttempts++
+
+			if !sio.waitBeforeRetry() {
+				return
+			}
+
+			continue
+		}
+
+		if failedAttempts > 0 {
+			sio.logger.Infow("Serial port is available again", "failedAttempts", failedAttempts)
+		}
+
+		failedAttempts = 0
+
+		if stopped := sio.serve(conn, connOptions); stopped {
+			return
+		}
+	}
+}
+
+func serialOpenErrorHint(err error) string {
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		return "The port is busy - close any serial monitor or other deej instance. Retrying in the background."
+	case errors.Is(err, os.ErrNotExist):
+		return "The port doesn't exist - is the box plugged in, and is com_port right? Retrying in the background."
+	default:
+		return fmt.Sprintf("%v. Retrying in the background.", err)
+	}
+}
+
+// waitBeforeRetry sleeps until the next connection attempt is due. a config
+// reload cuts the wait short, since it may have fixed the port. returns false
+// if we were stopped meanwhile
+func (sio *SerialIO) waitBeforeRetry() bool {
+	select {
+	case <-sio.stopChannel:
+		return false
+	case <-sio.configReloaded:
+		return true
+	case <-time.After(reconnectInterval):
+		return true
+	}
+}
+
+// serve reads lines from an open connection until it fails, the connection
+// parameters change, or we're stopped (in which case it returns true). the
+// connection is always closed on return
+func (sio *SerialIO) serve(conn io.ReadWriteCloser, connOptions serial.OpenOptions) bool {
+	logger := sio.logger.Named(strings.ToLower(connOptions.PortName))
+	logger.Infow("Connected", "baudRate", connOptions.BaudRate)
+
+	// a fresh connection starts from scratch: the channel count has to be
+	// re-established and every slider is re-sent once it is
+	sio.lastKnownNumSliders = 0
+	sio.pendingCount = 0
+
+	lines := make(chan string)
+	readErrors := make(chan error, 1)
+	done := make(chan struct{})
+
+	// deferred in this order so the port is closed first, which unblocks a
+	// reader stuck in ReadString, and then the reader is told to give up on a
+	// line it's still trying to hand over
+	defer close(done)
+	defer func() {
+		if err := conn.Close(); err != nil {
+			logger.Warnw("Failed to close serial connection", "error", err)
+		} else {
+			logger.Debug("Serial connection closed")
+		}
+	}()
 
 	go func() {
+		reader := bufio.NewReader(conn)
+
+		// the first line after opening the port usually starts mid-transmission,
+		// and a truncated first value still parses - "23" from "1023" - so it
+		// can't be told apart from a real reading. drop it unconditionally
+		firstLine := true
+
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
-
-				if sio.deej.Verbose() {
-					logger.Warnw("Failed to read line from serial", "error", err, "line", line)
-				}
-
-				// just ignore the line, the read loop will stop after this
+				readErrors <- err
 				return
+			}
+
+			if firstLine {
+				firstLine = false
+				continue
 			}
 
 			if sio.deej.Verbose() {
 				logger.Debugw("Read new line", "line", line)
 			}
 
-			// deliver the line to the channel
-			ch <- line
+			select {
+			case lines <- line:
+			case <-done:
+				return
+			}
 		}
 	}()
 
-	return ch
+	for {
+		select {
+		case <-sio.stopChannel:
+			return true
+
+		case <-sio.configReloaded:
+			if connOptionsFromConfig(sio.deej.config.current().ConnectionInfo) != connOptions {
+				logger.Info("Detected change in connection parameters, reconnecting")
+				return false
+			}
+
+		case err := <-readErrors:
+			logger.Warnw("Serial connection lost, reconnecting when the port comes back", "error", err)
+			return false
+
+		case line := <-lines:
+			sio.handleLine(logger, line)
+		}
+	}
 }
 
 func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
@@ -293,38 +390,45 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	splitLine := strings.Split(line, "|")
 	numSliders := len(splitLine)
 
-	// update our slider count, if needed - this will send slider move events for all
-	if numSliders != sio.lastKnownNumSliders {
-		logger.Infow("Detected sliders", "amount", numSliders)
-		sio.lastKnownNumSliders = numSliders
-		sio.currentSliderPercentValues = make([]float32, numSliders)
-		sio.currentButtonStates = make([]bool, numSliders)
+	// convert string values to integers ("1023" -> 1023). the pattern allows four
+	// digits, so a line with two values run together ("5000") gets through it -
+	// reject the whole line rather than hand a slider 488%
+	rawValues := make([]int, numSliders)
+	for idx, stringValue := range splitLine {
+		number, _ := strconv.Atoi(stringValue)
 
-		// reset everything to be an impossible value to force the slider move event later
+		if number > maxRawValue {
+			logger.Debugw("Got malformed line from serial, ignoring", "line", line)
+			return
+		}
+
+		rawValues[idx] = number
+	}
+
+	if !sio.confirmChannelCount(logger, numSliders) {
+		return
+	}
+
+	config := sio.deej.config.current()
+
+	moveEvents := []SliderMoveEvent{}
+	pressEvents := []ButtonPressEvent{}
+
+	sio.valuesLock.Lock()
+
+	// a config reload asks for every slider to be re-sent. buttons keep their
+	// state: re-zeroing them would make any held button fire again
+	if sio.resendSliders.Swap(false) {
 		for idx := range sio.currentSliderPercentValues {
 			sio.currentSliderPercentValues[idx] = -1.0
 		}
 	}
 
-	// for each slider:
-	moveEvents := []SliderMoveEvent{}
-	pressEvents := []ButtonPressEvent{}
-
-	for sliderIdx, stringValue := range splitLine {
-
-		// convert string values to integers ("1023" -> 1023)
-		number, _ := strconv.Atoi(stringValue)
-
-		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
-		// so let's check the first number for correctness just in case
-		if sliderIdx == 0 && number > 1023 {
-			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
-			return
-		}
+	for sliderIdx, number := range rawValues {
 
 		// channels mapped as buttons never reach the volume path - they carry a
 		// pressed/released state, not a level
-		if command, isButton := sio.deej.config.ButtonMapping.get(sliderIdx); isButton {
+		if command, isButton := config.ButtonMapping.get(sliderIdx); isButton {
 			if pressEvent, pressed := sio.handleButtonValue(logger, sliderIdx, number, command); pressed {
 				pressEvents = append(pressEvents, pressEvent)
 			}
@@ -333,18 +437,18 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		}
 
 		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
-		dirtyFloat := float32(number) / 1023.0
+		dirtyFloat := float32(number) / maxRawValue
 
 		// normalize it to an actual volume scalar between 0.0 and 1.0 with 2 points of precision
 		normalizedScalar := util.NormalizeScalar(dirtyFloat)
 
 		// if sliders are inverted, take the complement of 1.0
-		if sio.deej.config.InvertSliders {
+		if config.InvertSliders {
 			normalizedScalar = 1 - normalizedScalar
 		}
 
 		// check if it changes the desired state (could just be a jumpy raw slider value)
-		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, sio.deej.config.NoiseReductionLevel) {
+		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, config.NoiseReductionLevel) {
 
 			// if it does, update the saved value and create a move event
 			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
@@ -360,17 +464,12 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		}
 	}
 
-	// deliver move events if there are any, towards all potential consumers
-	if len(moveEvents) > 0 {
-		for _, consumer := range sio.sliderMoveConsumers {
-			for _, moveEvent := range moveEvents {
-				consumer <- moveEvent
-			}
-		}
-	}
+	sio.valuesLock.Unlock()
 
-	// same for button presses. these consumers are buffered, but a full buffer
-	// still can't be allowed to block the read loop - drop instead, and say so
+	// button presses go first. their consumers are buffered, but a full buffer
+	// still can't be allowed to block the read loop - drop instead, and say so.
+	// slider consumers are unbuffered and may be busy re-acquiring sessions, so
+	// delivering presses after them would delay a press for no reason
 	for _, consumer := range sio.buttonPressConsumers {
 		for _, pressEvent := range pressEvents {
 			select {
@@ -381,6 +480,54 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 			}
 		}
 	}
+
+	// deliver move events if there are any, towards all potential consumers
+	for _, consumer := range sio.sliderMoveConsumers {
+		for _, moveEvent := range moveEvents {
+			consumer <- moveEvent
+		}
+	}
+}
+
+// confirmChannelCount decides whether a line with numSliders channels can be
+// used. A count that differs from the one we've settled on has to repeat on
+// channelCountConfirmations consecutive lines first - that covers both the
+// first lines of a connection and a sketch that genuinely changed, while a one-
+// off line that lost or gained a separator is simply dropped.
+func (sio *SerialIO) confirmChannelCount(logger *zap.SugaredLogger, numSliders int) bool {
+	if numSliders == sio.lastKnownNumSliders {
+		sio.pendingCount = 0
+		return true
+	}
+
+	if numSliders == sio.pendingNumSliders && sio.pendingCount > 0 {
+		sio.pendingCount++
+	} else {
+		sio.pendingNumSliders = numSliders
+		sio.pendingCount = 1
+	}
+
+	if sio.pendingCount < channelCountConfirmations {
+		return false
+	}
+
+	logger.Infow("Detected sliders", "amount", numSliders)
+
+	sio.lastKnownNumSliders = numSliders
+	sio.pendingCount = 0
+
+	sio.valuesLock.Lock()
+	sio.currentSliderPercentValues = make([]float32, numSliders)
+
+	// reset everything to be an impossible value to force the slider move event later
+	for idx := range sio.currentSliderPercentValues {
+		sio.currentSliderPercentValues[idx] = -1.0
+	}
+	sio.valuesLock.Unlock()
+
+	sio.currentButtonStates = make([]bool, numSliders)
+
+	return true
 }
 
 // handleButtonValue folds a raw analog reading into the button's held/released

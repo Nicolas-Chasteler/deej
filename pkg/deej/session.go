@@ -20,9 +20,9 @@ type Session interface {
 }
 
 // staleSession is implemented by sessions that can tell when the thing they
-// point at has gone away. It's deliberately not part of Session: only the
-// PulseAudio sink-input sessions can go stale under us, and master/system/mic
-// sessions address a device that outlives any individual app.
+// point at has gone away: an app's stream that ended, or a default device that
+// currently doesn't exist. It's not part of Session because the Windows
+// sessions have no way to report it.
 type staleSession interface {
 	Stale() bool
 }
@@ -33,8 +33,10 @@ const (
 	// but it will not call the child GetVolume correctly :/
 	sessionCreationLogMessage = "Created audio session instance"
 
-	// format this with s.humanReadableDesc and whatever the current volume is
-	sessionStringFormat = "<session: %s, vol: %.2f>"
+	// format this with s.humanReadableDesc. deliberately no volume: reading it
+	// is a request to the audio server, and String() runs whenever a session
+	// is logged
+	sessionStringFormat = "<session: %s>"
 )
 
 type baseSession struct {

@@ -16,8 +16,16 @@ type sessionMap struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
 
+	// lock guards m, lastSessionRefresh and unmappedSessions. it's held only
+	// for the read or the swap itself, never across a request to the audio server
 	m    map[string][]Session
 	lock sync.Locker
+
+	// refreshLock serialises whole refreshes. four goroutines can ask for one
+	// (watchdog, new-session events, slider moves, config reloads), and two
+	// interleaved refreshes used to clear the map twice and then fill it twice,
+	// leaving every session in it two times over
+	refreshLock sync.Mutex
 
 	sessionFinder SessionFinder
 
@@ -74,7 +82,7 @@ func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionF
 }
 
 func (m *sessionMap) initialize() error {
-	if err := m.getAndAddSessions(); err != nil {
+	if err := m.reacquireSessions(); err != nil {
 		m.logger.Warnw("Failed to get all sessions during session map initialization", "error", err)
 		return fmt.Errorf("get all sessions during init: %w", err)
 	}
@@ -90,21 +98,36 @@ func (m *sessionMap) initialize() error {
 // setupVolumeWatchdog starts a background goroutine that periodically
 // re-asserts each slider's current value against its mapped sessions.
 // This corrects apps (e.g. Spotify, Firefox) that reset their own OS-level
-// volume and silently override the physical slider. Enabled only when
-// VolumeWatchdogInterval is non-zero in the config.
+// volume and silently override the physical slider. Active only while
+// VolumeWatchdogInterval is non-zero in the config; the interval is re-read
+// every tick, so changing it takes effect on reload.
 func (m *sessionMap) setupVolumeWatchdog() {
-	interval := m.deej.config.VolumeWatchdogInterval
-	if interval <= 0 {
-		return
-	}
 
-	m.logger.Infow("Starting volume watchdog", "interval", interval)
+	// how often to look at the config again while the watchdog is switched off
+	const disabledPollInterval = 5 * time.Second
 
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		var lastInterval time.Duration
 
-		for range ticker.C {
+		for {
+			interval := m.deej.config.current().VolumeWatchdogInterval
+
+			if interval != lastInterval {
+				if interval > 0 {
+					m.logger.Infow("Volume watchdog running", "interval", interval)
+				} else {
+					m.logger.Info("Volume watchdog disabled")
+				}
+
+				lastInterval = interval
+			}
+
+			if interval <= 0 {
+				time.Sleep(disabledPollInterval)
+				continue
+			}
+
+			time.Sleep(interval)
 			m.assertSliderVolumes()
 		}
 	}()
@@ -128,12 +151,19 @@ func (m *sessionMap) assertSliderVolumes() {
 	// a dead one and ask for a re-acquire.
 	staleFound := false
 
-	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+	m.deej.config.current().SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		if sliderIdx >= len(sliderValues) {
 			return
 		}
 
 		want := sliderValues[sliderIdx]
+
+		// -1 means the slider hasn't reported since the last reset (a new
+		// connection, or a config reload). there's nothing to enforce yet, and
+		// -1 pushed through as a volume wraps to an enormous unsigned value
+		if want < 0 {
+			return
+		}
 
 		for _, target := range targets {
 			for _, resolvedTarget := range m.resolveTarget(target) {
@@ -194,13 +224,19 @@ func (m *sessionMap) release() error {
 	return nil
 }
 
-// assumes the session map is clean!
-// only call on a new session map or as part of refreshSessions which calls reset
-func (m *sessionMap) getAndAddSessions() error {
+// reacquireSessions asks the finder for the current sessions and swaps them in.
+// The old set stays in place until the new one has been fetched: if the fetch
+// fails, slightly stale sessions are far more useful than none, and an empty
+// map would also hide every stale session that might trigger the next retry.
+// Callers other than initialize go through refreshSessions, which serialises
+// this.
+func (m *sessionMap) reacquireSessions() error {
 
-	// mark that we're refreshing before anything else
+	// mark the attempt before anything else, so a failing finder is retried at
+	// the normal rate rather than on every call
+	m.lock.Lock()
 	m.lastSessionRefresh = time.Now()
-	m.unmappedSessions = nil
+	m.lock.Unlock()
 
 	sessions, err := m.sessionFinder.GetAllSessions()
 	if err != nil {
@@ -208,12 +244,28 @@ func (m *sessionMap) getAndAddSessions() error {
 		return fmt.Errorf("get sessions from SessionFinder: %w", err)
 	}
 
+	newMap := make(map[string][]Session)
+	unmapped := []Session{}
+
 	for _, session := range sessions {
-		m.add(session)
+		key := session.Key()
+		newMap[key] = append(newMap[key], session)
 
 		if !m.sessionMapped(session) {
 			m.logger.Debugw("Tracking unmapped session", "session", session)
-			m.unmappedSessions = append(m.unmappedSessions, session)
+			unmapped = append(unmapped, session)
+		}
+	}
+
+	m.lock.Lock()
+	oldMap := m.m
+	m.m = newMap
+	m.unmappedSessions = unmapped
+	m.lock.Unlock()
+
+	for _, oldSessions := range oldMap {
+		for _, session := range oldSessions {
+			session.Release()
 		}
 	}
 
@@ -230,12 +282,15 @@ func (m *sessionMap) setupOnConfigReload() {
 	configReloadedChannel := m.deej.config.SubscribeToChanges()
 
 	go func() {
-		for {
-			select {
-			case <-configReloadedChannel:
-				m.logger.Info("Detected config reload, attempting to re-acquire all audio sessions")
-				m.refreshSessions(false)
-			}
+		for range configReloadedChannel {
+			m.logger.Info("Detected config reload, attempting to re-acquire all audio sessions")
+
+			// performance: forced because the mapping just changed, so which
+			// sessions count as unmapped has too. an unforced refresh is skipped
+			// if anything else refreshed in the last few seconds, which left
+			// deej.unmapped still driving an app that was just moved to its own
+			// slider - two sliders fighting over it every watchdog tick
+			m.refreshSessions(true)
 		}
 	}()
 }
@@ -244,31 +299,40 @@ func (m *sessionMap) setupOnSliderMove() {
 	sliderEventsChannel := m.deej.serial.SubscribeToSliderMoveEvents()
 
 	go func() {
-		for {
-			select {
-			case event := <-sliderEventsChannel:
-				m.handleSliderMoveEvent(event)
-			}
+		for event := range sliderEventsChannel {
+			m.handleSliderMoveEvent(event)
 		}
 	}()
 }
 
 // performance: explain why force == true at every such use to avoid unintended forced refresh spams
 func (m *sessionMap) refreshSessions(force bool) {
+	m.refreshLock.Lock()
+	defer m.refreshLock.Unlock()
 
-	// make sure enough time passed since the last refresh, unless force is true in which case always clear
-	if !force && m.lastSessionRefresh.Add(minTimeBetweenSessionRefreshes).After(time.Now()) {
+	// make sure enough time passed since the last refresh, unless force is true.
+	// checked under refreshLock, so a caller that waited for another refresh to
+	// finish sees that one's timestamp and doesn't immediately repeat it
+	if !force && time.Since(m.lastRefresh()) < minTimeBetweenSessionRefreshes {
 		return
 	}
 
-	// clear and release sessions first
-	m.clear()
-
-	if err := m.getAndAddSessions(); err != nil {
+	if err := m.reacquireSessions(); err != nil {
 		m.logger.Warnw("Failed to re-acquire all audio sessions", "error", err)
 	} else {
 		m.logger.Debug("Re-acquired sessions successfully")
 	}
+}
+
+func (m *sessionMap) lastRefresh() time.Time {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	return m.lastSessionRefresh
+}
+
+func (m *sessionMap) connectionLost() <-chan struct{} {
+	return m.sessionFinder.ConnectionLost()
 }
 
 // returns true if a session is not currently mapped to any slider, false otherwise
@@ -289,7 +353,7 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 	matchFound := false
 
 	// look through the actual mappings
-	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+	m.deej.config.current().SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		for _, target := range targets {
 
 			// ignore special transforms
@@ -319,7 +383,7 @@ func (m *sessionMap) applyKnownValues() {
 		return
 	}
 
-	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+	m.deej.config.current().SliderMapping.iterate(func(sliderIdx int, targets []string) {
 		if sliderIdx >= len(sliderValues) {
 			return
 		}
@@ -358,13 +422,13 @@ func (m *sessionMap) applyKnownValues() {
 func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 
 	// first of all, ensure our session map isn't moldy
-	if m.lastSessionRefresh.Add(maxTimeBetweenSessionRefreshes).Before(time.Now()) {
+	if time.Since(m.lastRefresh()) > maxTimeBetweenSessionRefreshes {
 		m.logger.Debug("Stale session map detected on slider move, refreshing")
 		m.refreshSessions(true)
 	}
 
 	// get the targets mapped to this slider from the config
-	targets, ok := m.deej.config.SliderMapping.get(event.SliderID)
+	targets, ok := m.deej.config.current().SliderMapping.get(event.SliderID)
 
 	// if slider not found in config, silently ignore
 	if !ok {
@@ -391,13 +455,13 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 				continue
 			}
 
-			// iterate all matching sessions and adjust the volume of each one
+			// iterate all matching sessions and adjust the volume of each one.
+			// no read-before-write: a value read back through PulseAudio or wpctl
+			// is rounded, so it never compared equal and only cost a round trip
 			for _, session := range sessions {
-				if session.GetVolume() != event.PercentValue {
-					if err := session.SetVolume(event.PercentValue); err != nil {
-						m.logger.Warnw("Failed to set target session volume", "error", err)
-						adjustmentFailed = true
-					}
+				if err := session.SetVolume(event.PercentValue); err != nil {
+					m.logger.Warnw("Failed to set target session volume", "error", err)
+					adjustmentFailed = true
 				}
 			}
 		}
@@ -458,6 +522,9 @@ func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 
 	// get currently unmapped sessions
 	case specialTargetAllUnmapped:
+		m.lock.Lock()
+		defer m.lock.Unlock()
+
 		targetKeys := make([]string, len(m.unmappedSessions))
 		for sessionIdx, session := range m.unmappedSessions {
 			targetKeys[sessionIdx] = session.Key()
@@ -469,43 +536,12 @@ func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 	return nil
 }
 
-func (m *sessionMap) add(value Session) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	key := value.Key()
-
-	existing, ok := m.m[key]
-	if !ok {
-		m.m[key] = []Session{value}
-	} else {
-		m.m[key] = append(existing, value)
-	}
-}
-
 func (m *sessionMap) get(key string) ([]Session, bool) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
 	value, ok := m.m[key]
 	return value, ok
-}
-
-func (m *sessionMap) clear() {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	m.logger.Debug("Releasing and clearing all audio sessions")
-
-	for key, sessions := range m.m {
-		for _, session := range sessions {
-			session.Release()
-		}
-
-		delete(m.m, key)
-	}
-
-	m.logger.Debug("Session map cleared")
 }
 
 func (m *sessionMap) String() string {

@@ -147,6 +147,17 @@ func (sf *wcaSessionFinder) GetAllSessions() ([]Session, error) {
 	return sessions, nil
 }
 
+// NewSessionChannel returns nil: new sessions are picked up by the periodic
+// refresh on Windows rather than by notification
+func (sf *wcaSessionFinder) NewSessionChannel() <-chan struct{} {
+	return nil
+}
+
+// ConnectionLost returns nil: there's no long-lived connection to lose
+func (sf *wcaSessionFinder) ConnectionLost() <-chan struct{} {
+	return nil
+}
+
 func (sf *wcaSessionFinder) Release() error {
 
 	// skip unregistering the mmnotificationclient, as it's not implemented in go-wca

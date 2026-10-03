@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -16,6 +17,28 @@ import (
 // CanonicalConfig provides application-wide access to configuration fields,
 // as well as loading/file watching logic for deej's configuration file
 type CanonicalConfig struct {
+
+	// values is replaced wholesale on every reload, from the file watcher's
+	// goroutine, while the serial, session and button goroutines are reading it.
+	// Readers take a copy through current() rather than reaching into fields
+	// that can change under them mid-line.
+	values     configValues
+	valuesLock sync.RWMutex
+
+	logger             *zap.SugaredLogger
+	notifier           Notifier
+	stopWatcherChannel chan bool
+
+	reloadConsumers []chan bool
+
+	userConfig     *viper.Viper
+	internalConfig *viper.Viper
+}
+
+// configValues is one parsed generation of the config. The maps inside it are
+// built fresh on each reload and never modified afterwards, so a copy of this
+// struct is safe to use for as long as the caller likes.
+type configValues struct {
 	SliderMapping *sliderMap
 
 	// ButtonMapping maps channel indexes that carry a button rather than a
@@ -24,10 +47,7 @@ type CanonicalConfig struct {
 	// appears here.
 	ButtonMapping *buttonMap
 
-	ConnectionInfo struct {
-		COMPort  string
-		BaudRate int
-	}
+	ConnectionInfo connectionInfo
 
 	InvertSliders bool
 
@@ -39,15 +59,11 @@ type CanonicalConfig struct {
 	// their own OS-level volume and override the physical slider position.
 	// Set to 0 (the default) to disable. Example values: "500ms", "1s".
 	VolumeWatchdogInterval time.Duration
+}
 
-	logger             *zap.SugaredLogger
-	notifier           Notifier
-	stopWatcherChannel chan bool
-
-	reloadConsumers []chan bool
-
-	userConfig     *viper.Viper
-	internalConfig *viper.Viper
+type connectionInfo struct {
+	COMPort  string
+	BaudRate int
 }
 
 const (
@@ -157,14 +173,24 @@ func (cc *CanonicalConfig) Load() error {
 		return fmt.Errorf("populate config fields: %w", err)
 	}
 
+	values := cc.current()
+
 	cc.logger.Info("Loaded config successfully")
 	cc.logger.Infow("Config values",
-		"sliderMapping", cc.SliderMapping,
-		"buttonMapping", cc.ButtonMapping,
-		"connectionInfo", cc.ConnectionInfo,
-		"invertSliders", cc.InvertSliders)
+		"sliderMapping", values.SliderMapping,
+		"buttonMapping", values.ButtonMapping,
+		"connectionInfo", values.ConnectionInfo,
+		"invertSliders", values.InvertSliders)
 
 	return nil
+}
+
+// current returns the config as of the last successful load
+func (cc *CanonicalConfig) current() configValues {
+	cc.valuesLock.RLock()
+	defer cc.valuesLock.RUnlock()
+
+	return cc.values
 }
 
 // SubscribeToChanges allows external components to receive updates when the config is reloaded
@@ -191,8 +217,10 @@ func (cc *CanonicalConfig) WatchConfigFileChanges() {
 	cc.userConfig.WatchConfig()
 	cc.userConfig.OnConfigChange(func(event fsnotify.Event) {
 
-		// when we get a write event...
-		if event.Op&fsnotify.Write == fsnotify.Write {
+		// when the file is written to, or replaced. editors that save atomically
+		// (Kate, anything using QSaveFile, install, mv) write a temp file and
+		// rename it over the original, which arrives as Create rather than Write
+		if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
 
 			now := time.Now()
 
@@ -232,9 +260,10 @@ func (cc *CanonicalConfig) StopWatchingConfigFile() {
 }
 
 func (cc *CanonicalConfig) populateFromVipers() error {
+	var values configValues
 
 	// merge the slider mappings from the user and internal configs
-	cc.SliderMapping = sliderMapFromConfigs(
+	values.SliderMapping = sliderMapFromConfigs(
 		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
@@ -250,30 +279,34 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	// button wins, since serial stops emitting move events for it - warn either
 	// way, because the slider half of that mapping will look silently broken
 	buttonMapping.iterate(func(buttonIdx int, _ string) {
-		if _, mappedAsSlider := cc.SliderMapping.get(buttonIdx); mappedAsSlider {
+		if _, mappedAsSlider := values.SliderMapping.get(buttonIdx); mappedAsSlider {
 			cc.logger.Warnw("Channel is mapped as both a slider and a button, treating it as a button",
 				"channel", buttonIdx)
 		}
 	})
 
-	cc.ButtonMapping = buttonMapping
+	values.ButtonMapping = buttonMapping
 
 	// get the rest of the config fields - viper saves us a lot of effort here
-	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
+	values.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
 
-	cc.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
-	if cc.ConnectionInfo.BaudRate <= 0 {
+	values.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
+	if values.ConnectionInfo.BaudRate <= 0 {
 		cc.logger.Warnw("Invalid baud rate specified, using default value",
 			"key", configKeyBaudRate,
-			"invalidValue", cc.ConnectionInfo.BaudRate,
+			"invalidValue", values.ConnectionInfo.BaudRate,
 			"defaultValue", defaultBaudRate)
 
-		cc.ConnectionInfo.BaudRate = defaultBaudRate
+		values.ConnectionInfo.BaudRate = defaultBaudRate
 	}
 
-	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
-	cc.VolumeWatchdogInterval = cc.userConfig.GetDuration(configKeyVolumeWatchdogInterval)
+	values.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
+	values.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	values.VolumeWatchdogInterval = cc.userConfig.GetDuration(configKeyVolumeWatchdogInterval)
+
+	cc.valuesLock.Lock()
+	cc.values = values
+	cc.valuesLock.Unlock()
 
 	cc.logger.Debug("Populated config fields from vipers")
 

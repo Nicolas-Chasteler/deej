@@ -151,7 +151,7 @@ func (s *wcaSession) Release() {
 }
 
 func (s *wcaSession) String() string {
-	return fmt.Sprintf(sessionStringFormat, s.humanReadableDesc, s.GetVolume())
+	return fmt.Sprintf(sessionStringFormat, s.humanReadableDesc)
 }
 
 func (s *masterSession) GetVolume() float32 {
@@ -190,7 +190,7 @@ func (s *masterSession) Release() {
 }
 
 func (s *masterSession) String() string {
-	return fmt.Sprintf(sessionStringFormat, s.humanReadableDesc, s.GetVolume())
+	return fmt.Sprintf(sessionStringFormat, s.humanReadableDesc)
 }
 
 func (s *masterSession) markAsStale() {

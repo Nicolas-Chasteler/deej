@@ -3,7 +3,6 @@
 package deej
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -27,7 +26,8 @@ type Deej struct {
 	sessions *sessionMap
 	buttons  *buttonRunner
 
-	stopChannel chan bool
+	// carries the exit code to leave with
+	stopChannel chan int
 	version     string
 	verbose     bool
 }
@@ -52,7 +52,7 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 		logger:      logger,
 		notifier:    notifier,
 		config:      config,
-		stopChannel: make(chan bool),
+		stopChannel: make(chan int),
 		verbose:     verbose,
 	}
 
@@ -146,50 +146,39 @@ func (d *Deej) run() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
-	// connect to the arduino for the first time
+	// connect to the arduino. this keeps retrying in the background, so a box
+	// that's unplugged at startup is picked up whenever it appears
+	d.serial.Start()
+
+	// the audio server going away (pipewire-pulse restarting) leaves our
+	// connection dead for good. there's nothing to recover in-process, so exit
+	// non-zero and let the service manager start us against the new server
 	go func() {
-		if err := d.serial.Start(); err != nil {
-			d.logger.Warnw("Failed to start first-time serial connection", "error", err)
+		<-d.sessions.connectionLost()
 
-			// If the port is busy, that's because something else is connected - notify and quit
-			if errors.Is(err, os.ErrPermission) {
-				d.logger.Warnw("Serial port seems busy, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port is busy, make sure to close any serial monitor or other deej instance.")
-
-				d.signalStop()
-
-				// also notify if the COM port they gave isn't found, maybe their config is wrong
-			} else if errors.Is(err, os.ErrNotExist) {
-				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This serial port doesn't exist, check your configuration and make sure it's set correctly.")
-
-				d.signalStop()
-			}
-		}
+		d.logger.Errorw("Lost connection to the audio server, exiting so deej can be restarted")
+		d.signalStopWithCode(1)
 	}()
 
 	// wait until stopped (gracefully)
-	<-d.stopChannel
-	d.logger.Debug("Stop channel signaled, terminating")
+	exitCode := <-d.stopChannel
+	d.logger.Debugw("Stop channel signaled, terminating", "exitCode", exitCode)
 
 	if err := d.stop(); err != nil {
 		d.logger.Warnw("Failed to stop deej", "error", err)
 		os.Exit(1)
-	} else {
-		// exit with 0
-		os.Exit(0)
 	}
+
+	os.Exit(exitCode)
 }
 
 func (d *Deej) signalStop() {
-	d.logger.Debug("Signalling stop channel")
-	d.stopChannel <- true
+	d.signalStopWithCode(0)
+}
+
+func (d *Deej) signalStopWithCode(exitCode int) {
+	d.logger.Debugw("Signalling stop channel", "exitCode", exitCode)
+	d.stopChannel <- exitCode
 }
 
 func (d *Deej) stop() error {
