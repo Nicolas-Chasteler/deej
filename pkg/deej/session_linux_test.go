@@ -67,3 +67,30 @@ func TestPAClientReportsDroppedConnection(t *testing.T) {
 		t.Fatalf("connection loss not reported (request error: %v)", err)
 	}
 }
+
+func TestDefaultDeviceTrackerSettles(t *testing.T) {
+	var tracker defaultDeviceTracker
+
+	// whatever is default when deej starts is enforced straight away
+	tracker.observe("bluez_output")
+	if tracker.settling() {
+		t.Fatal("the first device seen is settling, want it enforced immediately")
+	}
+
+	// a brief switch - deej-mic-toggle, or EasyEffects restarting - must not be
+	// enforced, or the slider value lands on a device with its own volume
+	tracker.observe("alsa_output")
+	if !tracker.settling() {
+		t.Fatal("a device that just became default isn't settling")
+	}
+
+	tracker.observe("alsa_output")
+	if !tracker.settling() {
+		t.Fatal("re-observing the same device ended the settle window early")
+	}
+
+	tracker.changedAt = time.Now().Add(-defaultDeviceSettleTime)
+	if tracker.settling() {
+		t.Fatal("still settling after defaultDeviceSettleTime")
+	}
+}

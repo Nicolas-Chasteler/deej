@@ -262,7 +262,16 @@ func (sio *SerialIO) connectionLoop() {
 
 		failedAttempts = 0
 
-		if stopped := sio.serve(conn, connOptions); stopped {
+		stopped := sio.serve(conn, connOptions)
+
+		// with the box gone its slider positions mean nothing. left in place,
+		// the watchdog would keep pinning every app to them and undo any
+		// volume change made some other way until the box came back
+		sio.valuesLock.Lock()
+		sio.currentSliderPercentValues = nil
+		sio.valuesLock.Unlock()
+
+		if stopped {
 			return
 		}
 	}

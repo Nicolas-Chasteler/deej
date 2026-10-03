@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -93,13 +94,52 @@ type paSession struct {
 	stale atomic.Bool
 }
 
+// defaultDeviceSettleTime is how long a device has to stay default before the
+// volume watchdog will correct it. Defaults move briefly on purpose -
+// deej-mic-toggle points the default source at a raw mic for a few seconds,
+// and EasyEffects restarting drops the default sink back to hardware - and
+// enforcing the slider during those windows would write it onto a device that
+// keeps its own, deliberately set, volume. Slider moves still apply at once.
+const defaultDeviceSettleTime = 5 * time.Second
+
+// defaultDeviceTracker remembers which device was default and since when. The
+// finder owns one per direction and hands it to every master session it
+// creates, because sessions are rebuilt on each refresh and the history must
+// outlive them.
+type defaultDeviceTracker struct {
+	lock      sync.Mutex
+	name      string
+	changedAt time.Time
+}
+
+// observe records the device currently reported as default
+func (t *defaultDeviceTracker) observe(name string) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	// the first device seen counts as settled: deej starting up isn't a change
+	if t.name != "" && t.name != name {
+		t.changedAt = time.Now()
+	}
+
+	t.name = name
+}
+
+func (t *defaultDeviceTracker) settling() bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return time.Since(t.changedAt) < defaultDeviceSettleTime
+}
+
 // masterSession controls the default output (master) or input (mic) device.
 // It addresses the device by PulseAudio's @DEFAULT_SINK@/@DEFAULT_SOURCE@
 // names rather than by index, so it always means "whatever is default now".
 type masterSession struct {
 	baseSession
 
-	client *paClient
+	client  *paClient
+	tracker *defaultDeviceTracker
 
 	isOutput bool
 
@@ -138,11 +178,13 @@ func newPASession(
 func newMasterSession(
 	logger *zap.SugaredLogger,
 	client *paClient,
+	tracker *defaultDeviceTracker,
 	isOutput bool,
 ) *masterSession {
 
 	s := &masterSession{
 		client:   client,
+		tracker:  tracker,
 		isOutput: isOutput,
 	}
 
@@ -224,7 +266,7 @@ func (s *paSession) String() string {
 }
 
 func (s *masterSession) GetVolume() float32 {
-	volumes, err := s.channelVolumes()
+	volumes, name, err := s.defaultDevice()
 	if err != nil {
 		if !s.unavailable.Swap(true) {
 			s.logger.Warnw("Default device is unavailable", "error", err)
@@ -237,18 +279,21 @@ func (s *masterSession) GetVolume() float32 {
 		s.logger.Info("Default device is available again")
 	}
 
+	s.tracker.observe(name)
+
 	return parseChannelVolumes(volumes)
 }
 
-// Stale reports that the last read of the default device failed. Refreshing
-// the map won't bring a device back, but it does stop the watchdog writing to
-// one that isn't there.
+// Stale reports that the watchdog should leave the default device alone: the
+// last read failed (there's no default device to write to), or the default
+// changed less than defaultDeviceSettleTime ago.
 func (s *masterSession) Stale() bool {
-	return s.unavailable.Load()
+	return s.unavailable.Load() || s.tracker.settling()
 }
 
-// channelVolumes reads the current per-channel volumes of the default device
-func (s *masterSession) channelVolumes() (proto.ChannelVolumes, error) {
+// defaultDevice reads the current per-channel volumes and name of the default
+// device
+func (s *masterSession) defaultDevice() (proto.ChannelVolumes, string, error) {
 	if s.isOutput {
 		request := proto.GetSinkInfo{
 			SinkIndex: proto.Undefined,
@@ -257,10 +302,10 @@ func (s *masterSession) channelVolumes() (proto.ChannelVolumes, error) {
 		reply := proto.GetSinkInfoReply{}
 
 		if err := s.client.Request(&request, &reply); err != nil {
-			return nil, fmt.Errorf("get default sink info: %w", err)
+			return nil, "", fmt.Errorf("get default sink info: %w", err)
 		}
 
-		return reply.ChannelVolumes, nil
+		return reply.ChannelVolumes, reply.SinkName, nil
 	}
 
 	request := proto.GetSourceInfo{
@@ -270,10 +315,10 @@ func (s *masterSession) channelVolumes() (proto.ChannelVolumes, error) {
 	reply := proto.GetSourceInfoReply{}
 
 	if err := s.client.Request(&request, &reply); err != nil {
-		return nil, fmt.Errorf("get default source info: %w", err)
+		return nil, "", fmt.Errorf("get default source info: %w", err)
 	}
 
-	return reply.ChannelVolumes, nil
+	return reply.ChannelVolumes, reply.SourceName, nil
 }
 
 func (s *masterSession) SetVolume(v float32) error {
@@ -282,7 +327,7 @@ func (s *masterSession) SetVolume(v float32) error {
 	// the default device can change between refreshes, and with it the channel
 	// count - a stereo speaker set and a mono headset mic can't take the same
 	// volume list. ask the current device rather than remembering one
-	current, err := s.channelVolumes()
+	current, _, err := s.defaultDevice()
 	if err != nil {
 		return fmt.Errorf("adjust session volume: %w", err)
 	}

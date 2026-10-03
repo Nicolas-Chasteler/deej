@@ -37,6 +37,11 @@ type paSessionFinder struct {
 	client       *paClient
 	conn         net.Conn
 	newSessionCh chan struct{}
+
+	// which device was default and since when, kept across refreshes for the
+	// master and mic sessions rebuilt on each one
+	defaultSink   defaultDeviceTracker
+	defaultSource defaultDeviceTracker
 }
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
@@ -107,8 +112,8 @@ func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 	// the master and mic sessions address whichever device is default at the
 	// time of each request, so they need nothing looked up here
 	sessions := []Session{
-		newMasterSession(sf.sessionLogger, sf.client, true),
-		newMasterSession(sf.sessionLogger, sf.client, false),
+		newMasterSession(sf.sessionLogger, sf.client, &sf.defaultSink, true),
+		newMasterSession(sf.sessionLogger, sf.client, &sf.defaultSource, false),
 	}
 
 	// enumerate sink inputs and add sessions along the way
